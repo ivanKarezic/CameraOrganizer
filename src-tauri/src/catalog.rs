@@ -27,7 +27,7 @@ pub struct MediaItem {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct SearchQuery {
     pub text: Option<String>,
     pub tag: Option<String>,

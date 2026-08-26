@@ -52,5 +52,9 @@ export async function pickDirectory(): Promise<string | null> {
 }
 
 export function previewUrl(path: string): string {
-  return convertFileSrc(path);
+  try {
+    return convertFileSrc(path);
+  } catch {
+    return "";
+  }
 }

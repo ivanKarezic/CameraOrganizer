@@ -4,7 +4,7 @@ export type DateSource = "exif" | "filename" | "mtime" | "unknown";
 export type StorageMode = "single" | "multiple";
 export type StorageKind = "local" | "network" | "external";
 export type TransferAction = "move" | "copy";
-export type ViewId = "library" | "search" | "organize" | "sync" | "settings";
+export type ViewId = "library" | "organize" | "sync" | "settings";
 
 export interface Storage {
   id: string;

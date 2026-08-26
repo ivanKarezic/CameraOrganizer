@@ -63,14 +63,13 @@ pub fn save_config(state: State<AppState>, config: AppConfig) -> Result<AppConfi
 #[tauri::command]
 pub fn scan_library(state: State<AppState>) -> Result<Vec<MediaItem>, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?.clone();
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let mut all = Vec::new();
+    let mut walked = Vec::new();
     for storage in &config.storages {
-        let items = walk_storage(storage).map_err(String::from)?;
-        for item in items {
-            catalog::upsert_media(&db, &item).map_err(String::from)?;
-            all.push(item);
-        }
+        walked.extend(walk_storage(storage).map_err(String::from)?);
+    }
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    for item in &walked {
+        catalog::upsert_media(&db, item).map_err(String::from)?;
     }
     catalog::list_all(&db).map_err(String::from)
 }

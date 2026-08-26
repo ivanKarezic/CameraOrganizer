@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   executeOrganize,
   executeSync,
@@ -13,6 +13,7 @@ import {
   searchMedia,
   setMediaTags,
 } from "./api";
+import { hasActiveFilters, matchesLibraryFilters, type KindVisibility } from "./lib/filter";
 import { formatBytes, formatCaptureDate, groupByDate } from "./lib/format";
 import type {
   AppConfig,
@@ -26,11 +27,12 @@ import type {
 
 const NAV: { id: ViewId; label: string }[] = [
   { id: "library", label: "Library" },
-  { id: "search", label: "Search" },
   { id: "organize", label: "Organize" },
   { id: "sync", label: "Import" },
   { id: "settings", label: "Settings" },
 ];
+
+type LibraryLayout = "thumbs" | "list";
 
 const emptyConfig = (): AppConfig => ({ storageMode: "single", storages: [] });
 
@@ -43,6 +45,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [unorganizedOnly, setUnorganizedOnly] = useState(false);
+  const [kinds, setKinds] = useState<KindVisibility>({ photo: true, video: true });
   const [search, setSearch] = useState<SearchQuery>({});
   const [tags, setTags] = useState<string[]>([]);
   const [ops, setOps] = useState<TransferOp[]>([]);
@@ -50,7 +53,36 @@ export default function App() {
   const [syncSource, setSyncSource] = useState("");
   const [syncStorageId, setSyncStorageId] = useState("");
 
-  async function refresh(nextQuery?: SearchQuery) {
+  async function loadCatalog() {
+    setBusy(true);
+    setError(null);
+    try {
+      const cfg = await getConfig();
+      setConfig(cfg);
+      if (!cfg.storages.length) {
+        setItems([]);
+        setStatus("Add a media storage in Settings.");
+        return;
+      }
+      const found = await searchMedia({});
+      setItems(found);
+      setTags(await listTags());
+      setStatus(
+        found.length
+          ? `${found.length} files in catalog.`
+          : "Catalog is empty. Scan the library to index files.",
+      );
+      if (!syncStorageId && cfg.storages[0]) {
+        setSyncStorageId(cfg.storages[0].id);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refresh() {
     setBusy(true);
     setError(null);
     try {
@@ -62,16 +94,9 @@ export default function App() {
         return;
       }
       const scanned = await scanLibrary();
-      const query = nextQuery ?? (unorganizedOnly ? { unorganizedOnly: true } : {});
-      const found = Object.values(query).some((v) => v)
-        ? await searchMedia(query)
-        : scanned;
-      setItems(found);
+      setItems(scanned);
       setTags(await listTags());
-      setStatus(`${found.length} files in catalog.`);
-      if (selected) {
-        setSelected(found.find((item) => item.id === selected.id) ?? found[0] ?? null);
-      }
+      setStatus(`${scanned.length} files in catalog.`);
       if (!syncStorageId && cfg.storages[0]) {
         setSyncStorageId(cfg.storages[0].id);
       }
@@ -83,15 +108,21 @@ export default function App() {
   }
 
   useEffect(() => {
-    void refresh();
+    void loadCatalog();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const visible = useMemo(
-    () => (unorganizedOnly && view === "library" ? items.filter((i) => !i.organized) : items),
-    [items, unorganizedOnly, view],
+    () => items.filter((item) => matchesLibraryFilters(item, search, unorganizedOnly, kinds)),
+    [items, search, unorganizedOnly, kinds],
   );
-  const groups = useMemo(() => groupByDate(visible.filter((i) => i.kind !== "sidecar")), [visible]);
+  const groups = useMemo(() => groupByDate(visible), [visible]);
+
+  useEffect(() => {
+    if (selected && !visible.some((item) => item.path === selected.path)) {
+      setSelected(null);
+    }
+  }, [visible, selected]);
 
   return (
     <div className="app-shell">
@@ -123,20 +154,20 @@ export default function App() {
             groups={groups}
             selected={selected}
             unorganizedOnly={unorganizedOnly}
-            busy={busy}
-            onToggleUnorganized={() => setUnorganizedOnly((v) => !v)}
-            onRefresh={() => void refresh()}
-            onSelect={setSelected}
-          />
-        )}
-        {view === "search" && (
-          <SearchView
+            kinds={kinds}
             search={search}
             tags={tags}
-            items={items}
-            selected={selected}
-            onChange={setSearch}
-            onSearch={() => void refresh(search)}
+            matchCount={visible.length}
+            busy={busy}
+            onToggleUnorganized={() => setUnorganizedOnly((v) => !v)}
+            onKindsChange={setKinds}
+            onSearchChange={setSearch}
+            onClearFilters={() => {
+              setSearch({});
+              setUnorganizedOnly(false);
+              setKinds({ photo: true, video: true });
+            }}
+            onRefresh={() => void refresh()}
             onSelect={setSelected}
           />
         )}
@@ -269,112 +300,110 @@ function LibraryView({
   groups,
   selected,
   unorganizedOnly,
+  kinds,
+  search,
+  tags,
+  matchCount,
   busy,
   onToggleUnorganized,
+  onKindsChange,
+  onSearchChange,
+  onClearFilters,
   onRefresh,
   onSelect,
 }: {
   groups: Map<string, MediaItem[]>;
   selected: MediaItem | null;
   unorganizedOnly: boolean;
+  kinds: KindVisibility;
+  search: SearchQuery;
+  tags: string[];
+  matchCount: number;
   busy: boolean;
   onToggleUnorganized: () => void;
+  onKindsChange: (kinds: KindVisibility) => void;
+  onSearchChange: (query: SearchQuery) => void;
+  onClearFilters: () => void;
   onRefresh: () => void;
   onSelect: (item: MediaItem) => void;
 }) {
+  const [layout, setLayout] = useState<LibraryLayout>("thumbs");
+  const filtering = hasActiveFilters(search, kinds) || unorganizedOnly;
   return (
-    <section>
-      <h2 className="section-title">CONTACT SHEET</h2>
-      <p className="lede">
-        A vault of camera originals. Dates come from metadata or the filename; tags stay searchable
-        even when files live across disks.
-      </p>
-      <div className="toolbar">
-        <button className="primary" onClick={onRefresh} disabled={busy}>
-          Scan library
-        </button>
-        <button className={unorganizedOnly ? "primary" : "ghost"} onClick={onToggleUnorganized}>
-          {unorganizedOnly ? "Showing unorganized" : "Show unorganized"}
-        </button>
-      </div>
-      {groups.size === 0 ? (
-        <div className="empty">No media yet. Add a storage path, then scan.</div>
-      ) : (
-        [...groups.entries()].map(([day, files]) => (
-          <div className="day-block" key={day}>
-            <div className="day-label">{day}</div>
-            <div className="grid">
-              {files.map((item) => (
-                <button
-                  key={item.path}
-                  className={selected?.path === item.path ? "card selected" : "card"}
-                  onClick={() => onSelect(item)}
-                >
-                  <span className="card-kind">{item.kind}</span>
-                  <span className="badge">{item.camera}</span>
-                  {!item.organized && <span className="badge unorganized">loose</span>}
-                  <span className="card-name">{item.filename}</span>
-                </button>
-              ))}
-            </div>
+    <section className="panel">
+      <div className="panel-head">
+        <h2 className="section-title">ROLL</h2>
+        <p className="lede">
+          Camera originals grouped by day. Tick photos or videos, then switch between thumbnails and
+          a compact list.
+        </p>
+        <div className="toolbar">
+          <button className="primary" onClick={onRefresh} disabled={busy}>
+            Scan library
+          </button>
+          <label className="tick">
+            <input
+              type="checkbox"
+              checked={kinds.photo}
+              onChange={(e) => onKindsChange({ ...kinds, photo: e.target.checked })}
+            />
+            Photos
+          </label>
+          <label className="tick">
+            <input
+              type="checkbox"
+              checked={kinds.video}
+              onChange={(e) => onKindsChange({ ...kinds, video: e.target.checked })}
+            />
+            Videos
+          </label>
+          <button className={unorganizedOnly ? "primary" : "ghost"} onClick={onToggleUnorganized}>
+            {unorganizedOnly ? "Showing unorganized" : "Show unorganized"}
+          </button>
+          {filtering ? (
+            <button className="ghost" onClick={onClearFilters}>
+              Clear filters
+            </button>
+          ) : null}
+          {filtering ? <span className="status">{matchCount} matching</span> : null}
+          <div className="view-toggle" role="group" aria-label="Library layout">
+            <button
+              className={layout === "thumbs" ? "active" : ""}
+              onClick={() => setLayout("thumbs")}
+            >
+              Thumbnails
+            </button>
+            <button className={layout === "list" ? "active" : ""} onClick={() => setLayout("list")}>
+              List
+            </button>
           </div>
-        ))
-      )}
-    </section>
-  );
-}
-
-function SearchView({
-  search,
-  tags,
-  items,
-  selected,
-  onChange,
-  onSearch,
-  onSelect,
-}: {
-  search: SearchQuery;
-  tags: string[];
-  items: MediaItem[];
-  selected: MediaItem | null;
-  onChange: (query: SearchQuery) => void;
-  onSearch: () => void;
-  onSelect: (item: MediaItem) => void;
-}) {
-  function submit(event: FormEvent) {
-    event.preventDefault();
-    onSearch();
-  }
-  return (
-    <section>
-      <h2 className="section-title">FIND</h2>
-      <p className="lede">Search the catalog by tag, camera, date, or the GPS label pulled from the file.</p>
-      <form className="toolbar" onSubmit={submit}>
+        </div>
+      <div className="toolbar">
         <input
           type="search"
           placeholder="Filename, tag, camera…"
           value={search.text ?? ""}
-          onChange={(e) => onChange({ ...search, text: e.target.value })}
+          onChange={(e) => onSearchChange({ ...search, text: e.target.value })}
         />
         <input
           type="text"
           placeholder="Location"
           value={search.location ?? ""}
-          onChange={(e) => onChange({ ...search, location: e.target.value })}
+          onChange={(e) => onSearchChange({ ...search, location: e.target.value })}
         />
         <input
           type="date"
           value={search.dateFrom ?? ""}
-          onChange={(e) => onChange({ ...search, dateFrom: e.target.value })}
+          onChange={(e) => onSearchChange({ ...search, dateFrom: e.target.value })}
         />
         <input
           type="date"
           value={search.dateTo ?? ""}
-          onChange={(e) => onChange({ ...search, dateTo: e.target.value })}
+          onChange={(e) => onSearchChange({ ...search, dateTo: e.target.value })}
         />
         <select
           value={search.camera ?? ""}
-          onChange={(e) => onChange({ ...search, camera: e.target.value || null })}
+          onChange={(e) => onSearchChange({ ...search, camera: e.target.value || null })}
         >
           <option value="">All cameras</option>
           <option>DJI</option>
@@ -384,31 +413,104 @@ function SearchView({
         </select>
         <select
           value={search.tag ?? ""}
-          onChange={(e) => onChange({ ...search, tag: e.target.value || null })}
+          onChange={(e) => onSearchChange({ ...search, tag: e.target.value || null })}
         >
           <option value="">All tags</option>
           {tags.map((tag) => (
             <option key={tag}>{tag}</option>
           ))}
         </select>
-        <button className="primary" type="submit">
-          Search
-        </button>
-      </form>
-      <div className="grid">
-        {items.map((item) => (
-          <button
-            key={item.path}
-            className={selected?.path === item.path ? "card selected" : "card"}
-            onClick={() => onSelect(item)}
-          >
-            <span className="card-kind">{formatCaptureDate(item.capturedAt)}</span>
-            <span className="badge">{item.camera}</span>
-            <span className="card-name">{item.filename}</span>
-          </button>
-        ))}
+      </div>
+      </div>
+      <div className="panel-scroll">
+      {groups.size === 0 ? (
+        <div className="empty">
+          {filtering ? "No files match these filters." : "No media yet. Add a storage path, then scan."}
+        </div>
+      ) : (
+        <>
+          {layout === "list" ? (
+            <div className="file-list-head">
+              <span>File name</span>
+              <span>Type</span>
+              <span>Tags</span>
+            </div>
+          ) : null}
+          {[...groups.entries()].map(([day, files]) => (
+            <div className={layout === "list" ? "day-block list-block" : "day-block"} key={day}>
+              <div className="day-label">{day}</div>
+              {layout === "thumbs" ? (
+                <div className="grid">
+                  {files.map((item) => (
+                    <button
+                      key={item.path}
+                      className={selected?.path === item.path ? "card selected" : "card"}
+                      onClick={() => onSelect(item)}
+                    >
+                      <div className="card-thumb">
+                        <MediaThumb item={item} />
+                      </div>
+                      <div className="card-meta">
+                        <span className="card-kind">{item.kind}</span>
+                        <span className="card-name">{item.filename}</span>
+                      </div>
+                      <span className="badge">{item.camera}</span>
+                      {!item.organized && <span className="badge unorganized">loose</span>}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                files.map((item) => (
+                  <button
+                    key={item.path}
+                    className={selected?.path === item.path ? "file-row selected" : "file-row"}
+                    onClick={() => onSelect(item)}
+                  >
+                    <span className="file-name">{item.filename}</span>
+                    <span className="file-type">{item.kind}</span>
+                    <span className="file-tags">
+                      {item.tags.length ? item.tags.join(", ") : "—"}
+                    </span>
+                  </button>
+                ))
+              )}
+            </div>
+          ))}
+        </>
+      )}
       </div>
     </section>
+  );
+}
+
+function MediaThumb({ item }: { item: MediaItem }) {
+  const slot = useRef<HTMLDivElement>(null);
+  const [active, setActive] = useState(false);
+
+  useEffect(() => {
+    const node = slot.current;
+    if (!node) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry?.isIntersecting) {
+          setActive(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "240px" },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  const src = active ? previewUrl(item.path) : "";
+  return (
+    <div ref={slot} className="thumb-slot">
+      {active && src && item.kind === "video" ? (
+        <video src={src} muted playsInline preload="metadata" />
+      ) : null}
+      {active && src && item.kind !== "video" ? <img src={src} alt="" loading="lazy" /> : null}
+    </div>
   );
 }
 
@@ -436,32 +538,36 @@ function OrganizeView({
     }
   }, [config, storageId]);
   return (
-    <section>
-      <h2 className="section-title">SHELVE</h2>
-      <p className="lede">
-        Existing library files are moved into year / day / Video or Photo. Review the plan, then move
-        everything or a selection.
-      </p>
-      <div className="toolbar">
-        <select value={storageId} onChange={(e) => setStorageId(e.target.value)}>
-          {config.storages.map((storage) => (
-            <option key={storage.id} value={storage.id}>
-              {storage.name}
-            </option>
-          ))}
-        </select>
-        <button className="ghost" disabled={busy || !storageId} onClick={() => onPreview(storageId)}>
-          Find unorganized
-        </button>
-        <button
-          className="primary"
-          disabled={busy || selectedOps.size === 0 || !storageId}
-          onClick={() => onExecute(storageId)}
-        >
-          Move selected
-        </button>
+    <section className="panel">
+      <div className="panel-head">
+        <h2 className="section-title">SHELVE</h2>
+        <p className="lede">
+          Existing library files are moved into year / day / Video or Photo. Review the plan, then move
+          everything or a selection.
+        </p>
+        <div className="toolbar">
+          <select value={storageId} onChange={(e) => setStorageId(e.target.value)}>
+            {config.storages.map((storage) => (
+              <option key={storage.id} value={storage.id}>
+                {storage.name}
+              </option>
+            ))}
+          </select>
+          <button className="ghost" disabled={busy || !storageId} onClick={() => onPreview(storageId)}>
+            Find unorganized
+          </button>
+          <button
+            className="primary"
+            disabled={busy || selectedOps.size === 0 || !storageId}
+            onClick={() => onExecute(storageId)}
+          >
+            Move selected
+          </button>
+        </div>
       </div>
-      <OpTable ops={ops} selectedOps={selectedOps} onToggle={onToggle} />
+      <div className="panel-scroll">
+        <OpTable ops={ops} selectedOps={selectedOps} onToggle={onToggle} />
+      </div>
     </section>
   );
 }
@@ -494,38 +600,42 @@ function SyncView({
   onExecute: () => void;
 }) {
   return (
-    <section>
-      <h2 className="section-title">INTAKE</h2>
-      <p className="lede">
-        Compare an SD card or other volume to the library. Missing files are copied into the correct
-        date folder — originals stay on the card.
-      </p>
-      <div className="toolbar">
-        <input
-          type="text"
-          style={{ minWidth: 280 }}
-          placeholder="External volume path"
-          value={source}
-          onChange={(e) => onSource(e.target.value)}
-        />
-        <button className="ghost" onClick={onPick}>
-          Browse
-        </button>
-        <select value={storageId} onChange={(e) => onStorage(e.target.value)}>
-          {config.storages.map((storage) => (
-            <option key={storage.id} value={storage.id}>
-              {storage.name}
-            </option>
-          ))}
-        </select>
-        <button className="ghost" disabled={busy || !source || !storageId} onClick={onPreview}>
-          Find missing
-        </button>
-        <button className="primary" disabled={busy || selectedOps.size === 0} onClick={onExecute}>
-          Copy selected
-        </button>
+    <section className="panel">
+      <div className="panel-head">
+        <h2 className="section-title">INTAKE</h2>
+        <p className="lede">
+          Compare an SD card or other volume to the library. Missing files are copied into the correct
+          date folder — originals stay on the card.
+        </p>
+        <div className="toolbar">
+          <input
+            type="text"
+            style={{ minWidth: 280 }}
+            placeholder="External volume path"
+            value={source}
+            onChange={(e) => onSource(e.target.value)}
+          />
+          <button className="ghost" onClick={onPick}>
+            Browse
+          </button>
+          <select value={storageId} onChange={(e) => onStorage(e.target.value)}>
+            {config.storages.map((storage) => (
+              <option key={storage.id} value={storage.id}>
+                {storage.name}
+              </option>
+            ))}
+          </select>
+          <button className="ghost" disabled={busy || !source || !storageId} onClick={onPreview}>
+            Find missing
+          </button>
+          <button className="primary" disabled={busy || selectedOps.size === 0} onClick={onExecute}>
+            Copy selected
+          </button>
+        </div>
       </div>
-      <OpTable ops={ops} selectedOps={selectedOps} onToggle={onToggle} />
+      <div className="panel-scroll">
+        <OpTable ops={ops} selectedOps={selectedOps} onToggle={onToggle} />
+      </div>
     </section>
   );
 }
@@ -607,68 +717,72 @@ function SettingsView({
   }
 
   return (
-    <section>
-      <h2 className="section-title">VAULT</h2>
-      <p className="lede">
-        One library disk, or several — local, mounted network, or a plugged-in drive. Paths are saved
-        in the app config file.
-      </p>
-      <div className="toolbar">
-        <select
-          value={config.storageMode}
-          onChange={(e) =>
-            onChange({
-              ...config,
-              storageMode: e.target.value as AppConfig["storageMode"],
-            })
-          }
-        >
-          <option value="single">Single location</option>
-          <option value="multiple">Multiple locations</option>
-        </select>
-        <button className="ghost" onClick={() => void addStorage()}>
-          Add storage
-        </button>
-        <button className="primary" onClick={onSave}>
-          Save configuration
-        </button>
-      </div>
-      {config.storages.map((storage) => (
-        <div className="storage-card" key={storage.id}>
-          <div className="toolbar">
-            <input
-              type="text"
-              value={storage.name}
-              onChange={(e) => update(storage.id, { name: e.target.value })}
-            />
-            <input
-              type="text"
-              style={{ minWidth: 280 }}
-              value={storage.path}
-              onChange={(e) => update(storage.id, { path: e.target.value })}
-            />
-            <select
-              value={storage.kind}
-              onChange={(e) => update(storage.id, { kind: e.target.value as StorageKind })}
-            >
-              <option value="local">Local disk</option>
-              <option value="network">Network storage</option>
-              <option value="external">External drive</option>
-            </select>
-            <button
-              className="danger"
-              onClick={() =>
-                onChange({
-                  ...config,
-                  storages: config.storages.filter((s) => s.id !== storage.id),
-                })
-              }
-            >
-              Remove
-            </button>
-          </div>
+    <section className="panel">
+      <div className="panel-head">
+        <h2 className="section-title">VAULT</h2>
+        <p className="lede">
+          One library disk, or several — local, mounted network, or a plugged-in drive. Paths are saved
+          in the app config file.
+        </p>
+        <div className="toolbar">
+          <select
+            value={config.storageMode}
+            onChange={(e) =>
+              onChange({
+                ...config,
+                storageMode: e.target.value as AppConfig["storageMode"],
+              })
+            }
+          >
+            <option value="single">Single location</option>
+            <option value="multiple">Multiple locations</option>
+          </select>
+          <button className="ghost" onClick={() => void addStorage()}>
+            Add storage
+          </button>
+          <button className="primary" onClick={onSave}>
+            Save configuration
+          </button>
         </div>
-      ))}
+      </div>
+      <div className="panel-scroll">
+        {config.storages.map((storage) => (
+          <div className="storage-card" key={storage.id}>
+            <div className="toolbar">
+              <input
+                type="text"
+                value={storage.name}
+                onChange={(e) => update(storage.id, { name: e.target.value })}
+              />
+              <input
+                type="text"
+                style={{ minWidth: 280 }}
+                value={storage.path}
+                onChange={(e) => update(storage.id, { path: e.target.value })}
+              />
+              <select
+                value={storage.kind}
+                onChange={(e) => update(storage.id, { kind: e.target.value as StorageKind })}
+              >
+                <option value="local">Local disk</option>
+                <option value="network">Network storage</option>
+                <option value="external">External drive</option>
+              </select>
+              <button
+                className="danger"
+                onClick={() =>
+                  onChange({
+                    ...config,
+                    storages: config.storages.filter((s) => s.id !== storage.id),
+                  })
+                }
+              >
+                Remove
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
     </section>
   );
 }
