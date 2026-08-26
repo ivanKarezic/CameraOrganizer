@@ -1,0 +1,32 @@
+[package]
+name = "camera-organizer"
+version = "0.1.0"
+description = "Multiplatform media library organizer for DJI, GoPro, and Insta360 files"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "camera_organizer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4.45", features = ["serde"] }
+toml = "1.1.4"
+thiserror = "2.0.20"
+walkdir = "2.5.0"
+regex = "1.13.1"
+uuid = { version = "1.25.0", features = ["v4"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+blake3 = "1.8.7"
+tauri-plugin-dialog = "2.7.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
