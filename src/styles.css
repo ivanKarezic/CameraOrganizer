@@ -523,13 +523,14 @@ select {
 }
 
 .preview-frame {
+  position: relative;
   aspect-ratio: 4 / 3;
   background: #0a0806;
   border: 1px solid var(--line);
   display: grid;
   place-items: center;
   overflow: hidden;
-  margin-bottom: 16px;
+  margin-bottom: 10px;
 }
 
 .preview-frame img,
@@ -537,6 +538,232 @@ select {
   width: 100%;
   height: 100%;
   object-fit: contain;
+}
+
+.preview-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2;
+  width: 34px;
+  height: 52px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(12, 10, 8, 0.72);
+  color: var(--cream);
+  border: 1px solid var(--line);
+  font-size: 22px;
+  line-height: 1;
+  backdrop-filter: blur(8px);
+}
+
+.preview-nav.prev {
+  left: 8px;
+}
+
+.preview-nav.next {
+  right: 8px;
+}
+
+.preview-nav:hover {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+
+.preview-count {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--muted);
+  text-align: center;
+  margin: 0 0 14px;
+}
+
+.date-range {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  min-width: min(100%, 280px);
+  flex: 1 1 280px;
+}
+
+.date-range-field {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 8px;
+  min-height: 42px;
+  padding: 6px 12px;
+  background: #140f0c;
+  color: var(--cream);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  text-align: left;
+}
+
+.date-range.open .date-range-field,
+.date-range-field:hover:not(:disabled) {
+  border-color: var(--amber);
+}
+
+.date-range-side {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+
+.date-range-kicker {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.date-range-value {
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.date-range-rule {
+  color: var(--amber);
+  font-size: 13px;
+}
+
+.date-range-clear {
+  width: 32px;
+  padding: 0;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-left: 0;
+  font-size: 16px;
+}
+
+.date-range-clear:hover {
+  color: var(--cream);
+  border-color: var(--amber);
+}
+
+.date-cal {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 20;
+  width: min(320px, 92vw);
+  padding: 12px;
+  background: #1a1510;
+  border: 1px solid var(--line);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+}
+
+.date-cal-head {
+  display: grid;
+  grid-template-columns: 32px 1fr 32px;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.date-cal-shift {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  background: transparent;
+  color: var(--cream);
+  border: 1px solid var(--line);
+  font-size: 18px;
+}
+
+.date-cal-shift:hover:not(:disabled) {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
+.date-cal-label {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  font-family: var(--display);
+  font-size: 18px;
+  letter-spacing: 0.06em;
+}
+
+.date-cal-label select {
+  padding: 2px 6px;
+  font-size: 11px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+}
+
+.date-cal-week,
+.date-cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px;
+}
+
+.date-cal-week {
+  margin-bottom: 4px;
+}
+
+.date-cal-week span {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  text-align: center;
+  padding: 4px 0;
+}
+
+.date-cal-day {
+  height: 34px;
+  padding: 0;
+  background: transparent;
+  color: var(--cream);
+  border: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.date-cal-day.empty {
+  color: rgba(154, 140, 120, 0.28);
+  cursor: default;
+}
+
+.date-cal-day.live:hover {
+  background: var(--amber-dim);
+  color: var(--amber);
+}
+
+.date-cal-day.in-range {
+  background: var(--amber-dim);
+}
+
+.date-cal-day.selected,
+.date-cal-day.start,
+.date-cal-day.end {
+  background: var(--amber);
+  color: #1a1208;
+}
+
+.date-cal-hint {
+  margin: 10px 0 0;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  line-height: 1.45;
 }
 
 .meta-list {

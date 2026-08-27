@@ -23,6 +23,8 @@ import {
   searchMedia,
   setMediaTags,
 } from "./api";
+import { DateRangePicker } from "./DateRangePicker";
+import { clampToDays, uniqueCaptureDays, wrappedIndex } from "./lib/dates";
 import { hasActiveFilters, matchesLibraryFilters, type KindVisibility } from "./lib/filter";
 import { formatBytes, formatCaptureDate, groupByDate } from "./lib/format";
 import type {
@@ -190,12 +192,47 @@ export default function App() {
     [items, search, unorganizedOnly, kinds],
   );
   const groups = useMemo(() => groupByDate(visible), [visible]);
+  const ordered = useMemo(() => [...groups.values()].flat(), [groups]);
+  const captureDays = useMemo(
+    () => uniqueCaptureDays(items.filter((item) => item.kind !== "sidecar").map((item) => item.capturedAt)),
+    [items],
+  );
 
   useEffect(() => {
     if (selected && !visible.some((item) => item.path === selected.path)) {
       setSelected(null);
     }
   }, [visible, selected]);
+
+  useEffect(() => {
+    if (!search.dateFrom && !search.dateTo) return;
+    const dateFrom = clampToDays(search.dateFrom, captureDays);
+    const dateTo = clampToDays(search.dateTo, captureDays);
+    if (dateFrom !== (search.dateFrom ?? null) || dateTo !== (search.dateTo ?? null)) {
+      setSearch((current) => ({ ...current, dateFrom, dateTo }));
+    }
+  }, [captureDays, search.dateFrom, search.dateTo]);
+
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName;
+      if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || tag === "VIDEO") return;
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      event.preventDefault();
+      stepPreview(event.key === "ArrowRight" ? 1 : -1);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selected, ordered]);
+
+  function stepPreview(delta: number) {
+    if (ordered.length === 0) return;
+    const index = selected
+      ? ordered.findIndex((item) => mediaKey(item) === mediaKey(selected))
+      : -1;
+    setSelected(ordered[wrappedIndex(index, delta, ordered.length)]);
+  }
 
   return (
     <div className={navCollapsed ? "app-shell nav-collapsed" : "app-shell"}>
@@ -247,6 +284,7 @@ export default function App() {
             unorganizedOnly={unorganizedOnly}
             kinds={kinds}
             search={search}
+            captureDays={captureDays}
             tags={tags}
             categories={categories}
             matchCount={visible.length}
@@ -413,6 +451,12 @@ export default function App() {
       </main>
       <PreviewPane
         item={selected}
+        index={
+          selected ? ordered.findIndex((item) => mediaKey(item) === mediaKey(selected)) : -1
+        }
+        total={ordered.length}
+        onPrev={() => stepPreview(-1)}
+        onNext={() => stepPreview(1)}
         globalTags={tags}
         categories={categories}
         marked={selected ? markedForDelete.has(mediaKey(selected)) : false}
@@ -432,13 +476,17 @@ export default function App() {
           try {
             await deleteMedia(selected.storageId, selected.id);
             const key = mediaKey(selected);
+            const remaining = ordered.filter((item) => mediaKey(item) !== key);
+            const index = ordered.findIndex((item) => mediaKey(item) === key);
             setItems((current) => current.filter((item) => mediaKey(item) !== key));
             setMarkedForDelete((current) => {
               const next = new Set(current);
               next.delete(key);
               return next;
             });
-            setSelected(null);
+            setSelected(
+              remaining.length ? remaining[Math.min(index, remaining.length - 1)] : null,
+            );
             setStatus("File deleted.");
           } catch (err) {
             setError(err instanceof Error ? err.message : String(err));
@@ -507,6 +555,7 @@ function LibraryView({
   unorganizedOnly,
   kinds,
   search,
+  captureDays,
   tags,
   categories,
   matchCount,
@@ -528,6 +577,7 @@ function LibraryView({
   unorganizedOnly: boolean;
   kinds: KindVisibility;
   search: SearchQuery;
+  captureDays: string[];
   tags: GlobalTag[];
   categories: TagCategory[];
   matchCount: number;
@@ -625,15 +675,11 @@ function LibraryView({
           value={search.location ?? ""}
           onChange={(e) => onSearchChange({ ...search, location: e.target.value })}
         />
-        <input
-          type="date"
-          value={search.dateFrom ?? ""}
-          onChange={(e) => onSearchChange({ ...search, dateFrom: e.target.value })}
-        />
-        <input
-          type="date"
-          value={search.dateTo ?? ""}
-          onChange={(e) => onSearchChange({ ...search, dateTo: e.target.value })}
+        <DateRangePicker
+          days={captureDays}
+          dateFrom={search.dateFrom}
+          dateTo={search.dateTo}
+          onChange={({ dateFrom, dateTo }) => onSearchChange({ ...search, dateFrom, dateTo })}
         />
         <select
           value={search.camera ?? ""}
@@ -1346,6 +1392,10 @@ function asMediaTag(tag: Pick<GlobalTag, "name" | "color" | "categoryId" | "cate
 
 function PreviewPane({
   item,
+  index,
+  total,
+  onPrev,
+  onNext,
   globalTags,
   categories,
   marked,
@@ -1355,6 +1405,10 @@ function PreviewPane({
   onCreateTag,
 }: {
   item: MediaItem | null;
+  index: number;
+  total: number;
+  onPrev: () => void;
+  onNext: () => void;
   globalTags: GlobalTag[];
   categories: TagCategory[];
   marked: boolean;
@@ -1378,6 +1432,16 @@ function PreviewPane({
     return (
       <aside className="preview-pane">
         <p className="lede">Select a frame to preview.</p>
+        {total > 0 ? (
+          <div className="toolbar">
+            <button type="button" className="ghost" onClick={onPrev} aria-label="Previous file">
+              Previous
+            </button>
+            <button type="button" className="ghost" onClick={onNext} aria-label="Next file">
+              Next
+            </button>
+          </div>
+        ) : null}
       </aside>
     );
   }
@@ -1392,7 +1456,22 @@ function PreviewPane({
         ) : (
           <span className="status">Sidecar — no preview</span>
         )}
+        {total > 0 ? (
+          <>
+            <button type="button" className="preview-nav prev" onClick={onPrev} aria-label="Previous file">
+              ‹
+            </button>
+            <button type="button" className="preview-nav next" onClick={onNext} aria-label="Next file">
+              ›
+            </button>
+          </>
+        ) : null}
       </div>
+      {total > 0 ? (
+        <div className="preview-count">
+          {index >= 0 ? index + 1 : 0} / {total}
+        </div>
+      ) : null}
       <div className="meta-list">
         <div>
           <strong>{item.filename}</strong>
