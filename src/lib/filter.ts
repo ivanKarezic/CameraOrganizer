@@ -15,6 +15,7 @@ export function hasActiveFilters(search: SearchQuery, kinds?: KindVisibility): b
       search.dateTo ||
       search.camera ||
       search.tag ||
+      search.tagCategory ||
       kindsNarrowed,
   );
 }
@@ -32,7 +33,12 @@ export function matchesLibraryFilters(
 
   const text = search.text?.trim().toLowerCase();
   if (text) {
-    const hay = [item.filename, item.camera, item.locationLabel ?? "", ...item.tags]
+    const hay = [
+      item.filename,
+      item.camera,
+      item.locationLabel ?? "",
+      ...item.tags.map((tag) => tag.name),
+    ]
       .join(" ")
       .toLowerCase();
     if (!hay.includes(text)) return false;
@@ -44,7 +50,13 @@ export function matchesLibraryFilters(
   }
 
   if (search.camera && item.camera !== search.camera) return false;
-  if (search.tag && !item.tags.some((tag) => tag.toLowerCase() === search.tag!.toLowerCase())) {
+  if (search.tag && !item.tags.some((tag) => tag.name.toLowerCase() === search.tag!.toLowerCase())) {
+    return false;
+  }
+  if (
+    search.tagCategory &&
+    !item.tags.some((tag) => tag.categoryName.toLowerCase() === search.tagCategory!.toLowerCase())
+  ) {
     return false;
   }
 

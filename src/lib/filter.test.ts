@@ -18,7 +18,8 @@ function item(overrides: Partial<MediaItem> = {}): MediaItem {
     longitude: 8.5,
     locationLabel: "47.1, 8.5",
     organized: true,
-    tags: ["alps"],
+    thumbnailPath: null,
+    tags: [{ name: "alps", color: "#e59a2a", categoryId: "c1", categoryName: "Places" }],
     ...overrides,
   };
 }
@@ -36,6 +37,8 @@ describe("matchesLibraryFilters", () => {
     expect(matchesLibraryFilters(shot, { text: "gopro" }, false)).toBe(false);
     expect(matchesLibraryFilters(shot, { tag: "alps" }, false)).toBe(true);
     expect(matchesLibraryFilters(shot, { tag: "ocean" }, false)).toBe(false);
+    expect(matchesLibraryFilters(shot, { tagCategory: "Places" }, false)).toBe(true);
+    expect(matchesLibraryFilters(shot, { tagCategory: "People" }, false)).toBe(false);
     expect(matchesLibraryFilters(shot, { camera: "GoPro" }, false)).toBe(false);
     expect(matchesLibraryFilters(shot, { location: "47.1" }, false)).toBe(true);
     expect(matchesLibraryFilters(shot, { dateFrom: "2024-08-27" }, false)).toBe(false);
@@ -61,6 +64,7 @@ describe("hasActiveFilters", () => {
 
   it("is true when any field is set", () => {
     expect(hasActiveFilters({ camera: "DJI" })).toBe(true);
+    expect(hasActiveFilters({ tagCategory: "Places" })).toBe(true);
     expect(hasActiveFilters({}, { photo: true, video: false })).toBe(true);
     expect(hasActiveFilters({}, { photo: true, video: true })).toBe(false);
   });

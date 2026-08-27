@@ -38,6 +38,13 @@ fn location_label(lat: Option<f64>, lon: Option<f64>) -> Option<String> {
 }
 
 pub fn walk_storage(storage: &Storage) -> AppResult<Vec<MediaItem>> {
+    walk_storage_with_progress(storage, |_, _| {})
+}
+
+pub fn walk_storage_with_progress<F>(storage: &Storage, mut on_progress: F) -> AppResult<Vec<MediaItem>>
+where
+    F: FnMut(u64, &str),
+{
     let root = PathBuf::from(&storage.path);
     if !root.exists() {
         return Err(crate::error::AppError::msg(format!(
@@ -47,7 +54,12 @@ pub fn walk_storage(storage: &Storage) -> AppResult<Vec<MediaItem>> {
     }
 
     let mut items = Vec::new();
-    for entry in WalkDir::new(&root).follow_links(false).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(crate::camorg::should_descend)
+        .filter_map(|e| e.ok())
+    {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -71,7 +83,7 @@ pub fn walk_storage(storage: &Storage) -> AppResult<Vec<MediaItem>> {
             id: 0,
             storage_id: storage.id.clone(),
             path: path.to_string_lossy().into_owned(),
-            filename: name,
+            filename: name.clone(),
             size: meta.len() as i64,
             hash: None,
             camera,
@@ -82,8 +94,10 @@ pub fn walk_storage(storage: &Storage) -> AppResult<Vec<MediaItem>> {
             longitude: hints.gps.map(|g| g.1),
             location_label: location_label(hints.gps.map(|g| g.0), hints.gps.map(|g| g.1)),
             organized: is_organized_path(rel),
+            thumbnail_path: None,
             tags: Vec::new(),
         });
+        on_progress(items.len() as u64, &name);
     }
     items.sort_by(|a, b| b.captured_at.cmp(&a.captured_at).then(a.filename.cmp(&b.filename)));
     Ok(items)
@@ -104,6 +118,8 @@ mod tests {
         fs::write(dir.path().join("inbox/DJI_20240826_143022_000_0001.MP4"), b"vid").unwrap();
         fs::write(dir.path().join("2024/2024-08-26/Photo/DJI_0001.JPG"), b"pic").unwrap();
         fs::write(dir.path().join("inbox/notes.txt"), b"nope").unwrap();
+        fs::create_dir_all(dir.path().join("CamOrg/Thumbnails")).unwrap();
+        fs::write(dir.path().join("CamOrg/Thumbnails/fake.jpg"), b"thumb").unwrap();
 
         let storage = AppConfig::new_storage(
             "Main".into(),
@@ -112,6 +128,7 @@ mod tests {
         );
         let items = walk_storage(&storage).unwrap();
         assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| !item.path.contains("CamOrg")));
         let video = items.iter().find(|i| i.filename.ends_with(".MP4")).unwrap();
         let photo = items.iter().find(|i| i.filename.ends_with(".JPG")).unwrap();
         assert!(!video.organized);

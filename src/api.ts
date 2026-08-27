@@ -1,6 +1,16 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { AppConfig, MediaItem, SearchQuery, TransferOp } from "./types";
+import type {
+  AppConfig,
+  GlobalTag,
+  JobProgress,
+  MediaItem,
+  MediaRef,
+  MediaTag,
+  SearchQuery,
+  TagCategory,
+  TransferOp,
+} from "./types";
 
 export async function getConfig(): Promise<AppConfig> {
   return invoke("get_config");
@@ -18,12 +28,59 @@ export async function searchMedia(query: SearchQuery): Promise<MediaItem[]> {
   return invoke("search_media", { query });
 }
 
-export async function listTags(): Promise<string[]> {
+export async function listTags(): Promise<GlobalTag[]> {
   return invoke("list_tags");
 }
 
-export async function setMediaTags(mediaId: number, tags: string[]): Promise<string[]> {
-  return invoke("set_media_tags", { mediaId, tags });
+export async function listTagCategories(): Promise<TagCategory[]> {
+  return invoke("list_tag_categories");
+}
+
+export async function saveTagCategory(category: {
+  id?: string | null;
+  name: string;
+  color: string;
+}): Promise<TagCategory> {
+  return invoke("save_tag_category", { category });
+}
+
+export async function deleteTagCategory(categoryId: string): Promise<void> {
+  return invoke("delete_tag_category", { categoryId });
+}
+
+export async function saveGlobalTag(tag: {
+  id?: string | null;
+  name: string;
+  categoryId: string;
+}): Promise<GlobalTag> {
+  return invoke("save_global_tag", { tag });
+}
+
+export async function deleteGlobalTag(tagId: string): Promise<void> {
+  return invoke("delete_global_tag", { tagId });
+}
+
+export async function setMediaTags(
+  storageId: string,
+  mediaId: number,
+  tags: string[],
+): Promise<MediaTag[]> {
+  return invoke("set_media_tags", { storageId, mediaId, tags });
+}
+
+export async function deleteMedia(storageId: string, mediaId: number): Promise<void> {
+  return invoke("delete_media", { storageId, mediaId });
+}
+
+export async function deleteMediaBatch(items: MediaRef[]): Promise<void> {
+  return invoke("delete_media_batch", { items });
+}
+
+export async function ensureThumbnail(
+  storageId: string,
+  mediaId: number,
+): Promise<string | null> {
+  return invoke("ensure_thumbnail", { storageId, mediaId });
 }
 
 export async function previewOrganize(storageId?: string): Promise<TransferOp[]> {
@@ -58,3 +115,5 @@ export function previewUrl(path: string): string {
     return "";
   }
 }
+
+export type { JobProgress };

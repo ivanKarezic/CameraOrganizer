@@ -26,6 +26,7 @@ uuid = { version = "1.25.0", features = ["v4"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 blake3 = "1.8.7"
 tauri-plugin-dialog = "2.7.2"
+image = { version = "0.25.9", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

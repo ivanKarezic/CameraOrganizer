@@ -1,14 +1,24 @@
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  deleteGlobalTag,
+  deleteMedia,
+  deleteMediaBatch,
+  deleteTagCategory,
+  ensureThumbnail,
   executeOrganize,
   executeSync,
   getConfig,
+  listTagCategories,
   listTags,
   pickDirectory,
   previewOrganize,
   previewSync,
   previewUrl,
   saveConfig,
+  saveGlobalTag,
+  saveTagCategory,
   scanLibrary,
   searchMedia,
   setMediaTags,
@@ -17,20 +27,38 @@ import { hasActiveFilters, matchesLibraryFilters, type KindVisibility } from "./
 import { formatBytes, formatCaptureDate, groupByDate } from "./lib/format";
 import type {
   AppConfig,
+  GlobalTag,
+  JobProgress,
   MediaItem,
+  MediaTag,
   SearchQuery,
   Storage,
   StorageKind,
+  TagCategory,
   TransferOp,
   ViewId,
 } from "./types";
+import { mediaKey } from "./types";
 
-const NAV: { id: ViewId; label: string }[] = [
-  { id: "library", label: "Library" },
-  { id: "organize", label: "Organize" },
-  { id: "sync", label: "Import" },
-  { id: "settings", label: "Settings" },
+const NAV: { id: ViewId; label: string; icon: NavIconId }[] = [
+  { id: "library", label: "Library", icon: "library" },
+  { id: "organize", label: "Organize", icon: "organize" },
+  { id: "sync", label: "Import", icon: "import" },
+  { id: "tags", label: "Tags", icon: "tags" },
+  { id: "settings", label: "Settings", icon: "settings" },
 ];
+
+const CLASS_COLORS = ["#e59a2a", "#7ea36a", "#6a93c4", "#c45c3a", "#9b7ed9", "#d4c06a"];
+
+type NavIconId = "library" | "organize" | "import" | "tags" | "settings";
+
+const SCAN_PROGRESS: JobProgress = {
+  job: "scan",
+  current: 0,
+  total: 0,
+  filename: "",
+  message: "Scanning library…",
+};
 
 type LibraryLayout = "thumbs" | "list";
 
@@ -44,14 +72,47 @@ export default function App() {
   const [status, setStatus] = useState("Ready.");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [progress, setProgress] = useState<JobProgress | null>(null);
   const [unorganizedOnly, setUnorganizedOnly] = useState(false);
   const [kinds, setKinds] = useState<KindVisibility>({ photo: true, video: true });
   const [search, setSearch] = useState<SearchQuery>({});
-  const [tags, setTags] = useState<string[]>([]);
+  const [tags, setTags] = useState<GlobalTag[]>([]);
+  const [categories, setCategories] = useState<TagCategory[]>([]);
+  const [markedForDelete, setMarkedForDelete] = useState<Set<string>>(new Set());
+  const [navCollapsed, setNavCollapsed] = useState(false);
   const [ops, setOps] = useState<TransferOp[]>([]);
   const [selectedOps, setSelectedOps] = useState<Set<string>>(new Set());
   const [syncSource, setSyncSource] = useState("");
   const [syncStorageId, setSyncStorageId] = useState("");
+
+  useEffect(() => {
+    const webview = getCurrentWebviewWindow();
+    let unlisten: (() => void) | undefined;
+    const onProgress = (payload: JobProgress) => {
+      setProgress(payload);
+      const count =
+        payload.total > 0
+          ? ` ${payload.current}/${payload.total}`
+          : payload.current > 0
+            ? ` ${payload.current}`
+            : "";
+      setStatus(
+        payload.filename ? `${payload.message}${count} — ${payload.filename}` : `${payload.message}${count}`,
+      );
+    };
+    void webview
+      .listen<JobProgress>("job-progress", (event) => onProgress(event.payload))
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {
+        void listen<JobProgress>("job-progress", (event) => onProgress(event.payload)).then((fn) => {
+          unlisten = fn;
+        });
+      });
+    return () => unlisten?.();
+  }, []);
 
   async function loadCatalog() {
     setBusy(true);
@@ -66,7 +127,7 @@ export default function App() {
       }
       const found = await searchMedia({});
       setItems(found);
-      setTags(await listTags());
+      await reloadTagStore();
       setStatus(
         found.length
           ? `${found.length} files in catalog.`
@@ -79,12 +140,16 @@ export default function App() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
+      setProgress(null);
     }
   }
 
   async function refresh() {
     setBusy(true);
+    setScanning(true);
     setError(null);
+    setProgress(SCAN_PROGRESS);
+    setStatus("Scanning library…");
     try {
       const cfg = await getConfig();
       setConfig(cfg);
@@ -95,7 +160,7 @@ export default function App() {
       }
       const scanned = await scanLibrary();
       setItems(scanned);
-      setTags(await listTags());
+      await reloadTagStore();
       setStatus(`${scanned.length} files in catalog.`);
       if (!syncStorageId && cfg.storages[0]) {
         setSyncStorageId(cfg.storages[0].id);
@@ -104,7 +169,15 @@ export default function App() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
+      setScanning(false);
+      setProgress(null);
     }
+  }
+
+  async function reloadTagStore() {
+    const [nextTags, nextCategories] = await Promise.all([listTags(), listTagCategories()]);
+    setTags(nextTags);
+    setCategories(nextCategories);
   }
 
   useEffect(() => {
@@ -125,28 +198,46 @@ export default function App() {
   }, [visible, selected]);
 
   return (
-    <div className="app-shell">
-      <aside className="sprocket" aria-hidden="true">
-        <div className="sprocket-holes" />
-      </aside>
-      <nav className="nav">
-        <h1 className="wordmark">
-          CAMERA
-          <br />
-          <span>ORGANIZER</span>
-        </h1>
+    <div className={navCollapsed ? "app-shell nav-collapsed" : "app-shell"}>
+      <nav className="nav" aria-label="Main">
+        <div className="nav-brand">
+          <h1 className="wordmark">
+            {navCollapsed ? (
+              <>
+                C<span>O</span>
+              </>
+            ) : (
+              <>
+                CAMERA
+                <br />
+                <span>ORGANIZER</span>
+              </>
+            )}
+          </h1>
+          <button
+            className="nav-collapse"
+            onClick={() => setNavCollapsed((value) => !value)}
+            title={navCollapsed ? "Expand sidebar" : "Minimize sidebar"}
+            aria-label={navCollapsed ? "Expand sidebar" : "Minimize sidebar"}
+          >
+            <SidebarIcon />
+          </button>
+        </div>
         <div className="nav-links">
           {NAV.map((item) => (
             <button
               key={item.id}
               className={view === item.id ? "active" : ""}
               onClick={() => setView(item.id)}
+              title={item.label}
             >
-              {item.label}
+              <NavIcon id={item.icon} />
+              <span className="nav-label">{item.label}</span>
             </button>
           ))}
         </div>
-        <p className={error ? "status error" : "status"}>{error ?? status}</p>
+        {navCollapsed ? null : <p className={error ? "status error" : "status"}>{error ?? status}</p>}
+        {navCollapsed ? null : <ProgressMeter progress={progress} />}
       </nav>
       <main className="stage">
         {view === "library" && (
@@ -157,8 +248,11 @@ export default function App() {
             kinds={kinds}
             search={search}
             tags={tags}
+            categories={categories}
             matchCount={visible.length}
             busy={busy}
+            scanning={scanning}
+            progress={progress}
             onToggleUnorganized={() => setUnorganizedOnly((v) => !v)}
             onKindsChange={setKinds}
             onSearchChange={setSearch}
@@ -169,6 +263,29 @@ export default function App() {
             }}
             onRefresh={() => void refresh()}
             onSelect={setSelected}
+            markedForDelete={markedForDelete}
+            onClearMarked={() => setMarkedForDelete(new Set())}
+            onDeleteMarked={async () => {
+              if (markedForDelete.size === 0) return;
+              setBusy(true);
+              try {
+                const refs = items
+                  .filter((item) => markedForDelete.has(mediaKey(item)))
+                  .map((item) => ({ storageId: item.storageId, mediaId: item.id }));
+                await deleteMediaBatch(refs);
+                const removed = new Set(refs.map((ref) => `${ref.storageId}:${ref.mediaId}`));
+                setItems((current) =>
+                  current.filter((item) => !removed.has(mediaKey(item))),
+                );
+                setMarkedForDelete(new Set());
+                if (selected && removed.has(mediaKey(selected))) setSelected(null);
+                setStatus(`Deleted ${refs.length} file${refs.length === 1 ? "" : "s"}.`);
+              } catch (err) {
+                setError(err instanceof Error ? err.message : String(err));
+              } finally {
+                setBusy(false);
+              }
+            }}
           />
         )}
         {view === "organize" && (
@@ -177,6 +294,7 @@ export default function App() {
             ops={ops}
             selectedOps={selectedOps}
             busy={busy}
+            progress={progress}
             onPreview={async (storageId?: string) => {
               setBusy(true);
               try {
@@ -208,6 +326,7 @@ export default function App() {
                 setError(String(err));
               } finally {
                 setBusy(false);
+                setProgress(null);
               }
             }}
           />
@@ -220,6 +339,7 @@ export default function App() {
             ops={ops}
             selectedOps={selectedOps}
             busy={busy}
+            progress={progress}
             onSource={setSyncSource}
             onStorage={setSyncStorageId}
             onPick={async () => {
@@ -257,8 +377,17 @@ export default function App() {
                 setError(String(err));
               } finally {
                 setBusy(false);
+                setProgress(null);
               }
             }}
+          />
+        )}
+        {view === "tags" && (
+          <TagsView
+            tags={tags}
+            categories={categories}
+            onReload={reloadTagStore}
+            onError={setError}
           />
         )}
         {view === "settings" && (
@@ -276,6 +405,7 @@ export default function App() {
                 setError(String(err));
               } finally {
                 setBusy(false);
+                setProgress(null);
               }
             }}
           />
@@ -283,15 +413,90 @@ export default function App() {
       </main>
       <PreviewPane
         item={selected}
+        globalTags={tags}
+        categories={categories}
+        marked={selected ? markedForDelete.has(mediaKey(selected)) : false}
+        onMarkedChange={(checked) => {
+          if (!selected) return;
+          const key = mediaKey(selected);
+          setMarkedForDelete((current) => {
+            const next = new Set(current);
+            if (checked) next.add(key);
+            else next.delete(key);
+            return next;
+          });
+        }}
+        onDeleteCurrent={async () => {
+          if (!selected) return;
+          setBusy(true);
+          try {
+            await deleteMedia(selected.storageId, selected.id);
+            const key = mediaKey(selected);
+            setItems((current) => current.filter((item) => mediaKey(item) !== key));
+            setMarkedForDelete((current) => {
+              const next = new Set(current);
+              next.delete(key);
+              return next;
+            });
+            setSelected(null);
+            setStatus("File deleted.");
+          } catch (err) {
+            setError(err instanceof Error ? err.message : String(err));
+          } finally {
+            setBusy(false);
+          }
+        }}
         onTags={async (nextTags) => {
           if (!selected) return;
-          const saved = await setMediaTags(selected.id, nextTags);
+          const saved = await setMediaTags(
+            selected.storageId,
+            selected.id,
+            nextTags.map((tag) => tag.name),
+          );
           setSelected({ ...selected, tags: saved });
           setItems((current) =>
-            current.map((item) => (item.id === selected.id ? { ...item, tags: saved } : item)),
+            current.map((item) =>
+              item.id === selected.id && item.storageId === selected.storageId
+                ? { ...item, tags: saved }
+                : item,
+            ),
           );
         }}
+        onCreateTag={async (name, categoryId) => {
+          const created = await saveGlobalTag({ name, categoryId });
+          await reloadTagStore();
+          return created;
+        }}
       />
+    </div>
+  );
+}
+
+function ProgressMeter({ progress }: { progress: JobProgress | null }) {
+  if (!progress) return null;
+  const pct = progress.total > 0 ? Math.min(100, (progress.current / progress.total) * 100) : 0;
+  return (
+    <div className="progress-meter" role="status">
+      <div className="progress-label">
+        {progress.message}
+        {progress.filename ? ` — ${progress.filename}` : ""}
+      </div>
+      <div className="progress-track">
+        <div
+          className={progress.total > 0 ? "progress-fill" : "progress-fill indeterminate"}
+          style={progress.total > 0 ? { width: `${pct}%` } : undefined}
+        />
+      </div>
+      {progress.total > 0 ? (
+        <div className="progress-count">
+          {progress.current} / {progress.total}
+          {` · ${Math.round(pct)}%`}
+        </div>
+      ) : progress.current > 0 ? (
+        <div className="progress-count">{progress.current} files</div>
+      ) : (
+        <div className="progress-count">Working…</div>
+      )}
     </div>
   );
 }
@@ -303,31 +508,43 @@ function LibraryView({
   kinds,
   search,
   tags,
+  categories,
   matchCount,
   busy,
+  scanning,
+  progress,
   onToggleUnorganized,
   onKindsChange,
   onSearchChange,
   onClearFilters,
   onRefresh,
   onSelect,
+  markedForDelete,
+  onClearMarked,
+  onDeleteMarked,
 }: {
   groups: Map<string, MediaItem[]>;
   selected: MediaItem | null;
   unorganizedOnly: boolean;
   kinds: KindVisibility;
   search: SearchQuery;
-  tags: string[];
+  tags: GlobalTag[];
+  categories: TagCategory[];
   matchCount: number;
   busy: boolean;
+  scanning: boolean;
+  progress: JobProgress | null;
   onToggleUnorganized: () => void;
   onKindsChange: (kinds: KindVisibility) => void;
   onSearchChange: (query: SearchQuery) => void;
   onClearFilters: () => void;
   onRefresh: () => void;
   onSelect: (item: MediaItem) => void;
+  markedForDelete: Set<string>;
+  onClearMarked: () => void;
+  onDeleteMarked: () => void;
 }) {
-  const [layout, setLayout] = useState<LibraryLayout>("thumbs");
+  const [layout, setLayout] = useState<LibraryLayout>("list");
   const filtering = hasActiveFilters(search, kinds) || unorganizedOnly;
   return (
     <section className="panel">
@@ -339,33 +556,50 @@ function LibraryView({
         </p>
         <div className="toolbar">
           <button className="primary" onClick={onRefresh} disabled={busy}>
-            Scan library
+            {scanning ? "Scanning…" : "Scan library"}
           </button>
-          <label className="tick">
-            <input
-              type="checkbox"
-              checked={kinds.photo}
-              onChange={(e) => onKindsChange({ ...kinds, photo: e.target.checked })}
-            />
-            Photos
-          </label>
-          <label className="tick">
-            <input
-              type="checkbox"
-              checked={kinds.video}
-              onChange={(e) => onKindsChange({ ...kinds, video: e.target.checked })}
-            />
-            Videos
-          </label>
-          <button className={unorganizedOnly ? "primary" : "ghost"} onClick={onToggleUnorganized}>
-            {unorganizedOnly ? "Showing unorganized" : "Show unorganized"}
+          <button
+            className="danger"
+            disabled={busy || markedForDelete.size === 0}
+            onClick={onDeleteMarked}
+          >
+            Delete marked{markedForDelete.size ? ` (${markedForDelete.size})` : ""}
           </button>
-          {filtering ? (
-            <button className="ghost" onClick={onClearFilters}>
-              Clear filters
-            </button>
-          ) : null}
-          {filtering ? <span className="status">{matchCount} matching</span> : null}
+          <button
+            className="primary"
+            disabled={busy || markedForDelete.size === 0}
+            onClick={onClearMarked}
+          >
+            Clear selected{markedForDelete.size ? ` (${markedForDelete.size})` : ""}
+          </button>
+        </div>
+        <div className="toolbar library-toggles">
+          <div className="tick-group">
+            <label className="tick">
+              <input
+                type="checkbox"
+                checked={kinds.photo}
+                onChange={(e) => onKindsChange({ ...kinds, photo: e.target.checked })}
+              />
+              Photos
+            </label>
+            <label className="tick">
+              <input
+                type="checkbox"
+                checked={kinds.video}
+                onChange={(e) => onKindsChange({ ...kinds, video: e.target.checked })}
+              />
+              Videos
+            </label>
+            <label className="tick">
+              <input
+                type="checkbox"
+                checked={unorganizedOnly}
+                onChange={onToggleUnorganized}
+              />
+              Show unorganized
+            </label>
+          </div>
           <div className="view-toggle" role="group" aria-label="Library layout">
             <button
               className={layout === "thumbs" ? "active" : ""}
@@ -412,15 +646,56 @@ function LibraryView({
           <option>Unknown</option>
         </select>
         <select
+          value={search.tagCategory ?? ""}
+          onChange={(e) => {
+            const tagCategory = e.target.value || null;
+            const next: SearchQuery = { ...search, tagCategory };
+            if (
+              search.tag &&
+              tagCategory &&
+              !tags.some(
+                (tag) =>
+                  tag.name === search.tag &&
+                  tag.categoryName.toLowerCase() === tagCategory.toLowerCase(),
+              )
+            ) {
+              next.tag = null;
+            }
+            onSearchChange(next);
+          }}
+        >
+          <option value="">All categories</option>
+          {categories.map((category) => (
+            <option key={category.id} value={category.name}>
+              {category.name}
+            </option>
+          ))}
+        </select>
+        <select
           value={search.tag ?? ""}
           onChange={(e) => onSearchChange({ ...search, tag: e.target.value || null })}
         >
           <option value="">All tags</option>
-          {tags.map((tag) => (
-            <option key={tag}>{tag}</option>
-          ))}
+          {tags
+            .filter(
+              (tag) =>
+                !search.tagCategory ||
+                tag.categoryName.toLowerCase() === search.tagCategory.toLowerCase(),
+            )
+            .map((tag) => (
+              <option key={tag.id} value={tag.name}>
+                {tag.name}
+              </option>
+            ))}
         </select>
+        {filtering ? (
+          <button className="ghost" onClick={onClearFilters}>
+            Clear filters
+          </button>
+        ) : null}
+        {filtering ? <span className="status">{matchCount} matching</span> : null}
       </div>
+      {scanning ? <ProgressMeter progress={progress ?? SCAN_PROGRESS} /> : null}
       </div>
       <div className="panel-scroll">
       {groups.size === 0 ? (
@@ -431,6 +706,7 @@ function LibraryView({
         <>
           {layout === "list" ? (
             <div className="file-list-head">
+              <span></span>
               <span>File name</span>
               <span>Type</span>
               <span>Tags</span>
@@ -456,6 +732,11 @@ function LibraryView({
                       </div>
                       <span className="badge">{item.camera}</span>
                       {!item.organized && <span className="badge unorganized">loose</span>}
+                      {markedForDelete.has(mediaKey(item)) ? (
+                        <span className="trash-mark" title="Marked for deletion">
+                          ⌫
+                        </span>
+                      ) : null}
                     </button>
                   ))}
                 </div>
@@ -466,10 +747,31 @@ function LibraryView({
                     className={selected?.path === item.path ? "file-row selected" : "file-row"}
                     onClick={() => onSelect(item)}
                   >
+                    <span className="file-mark">
+                      {markedForDelete.has(mediaKey(item)) ? (
+                        <span className="trash-mark" title="Marked for deletion">
+                          ⌫
+                        </span>
+                      ) : null}
+                    </span>
                     <span className="file-name">{item.filename}</span>
                     <span className="file-type">{item.kind}</span>
                     <span className="file-tags">
-                      {item.tags.length ? item.tags.join(", ") : "—"}
+                      {item.tags.length ? (
+                        <span className="tag-row compact">
+                          {item.tags.map((tag) => (
+                            <span
+                              key={tag.name}
+                              className="tag"
+                              style={{ borderColor: tag.color, color: tag.color }}
+                            >
+                              {tag.name}
+                            </span>
+                          ))}
+                        </span>
+                      ) : (
+                        "—"
+                      )}
                     </span>
                   </button>
                 ))
@@ -486,6 +788,11 @@ function LibraryView({
 function MediaThumb({ item }: { item: MediaItem }) {
   const slot = useRef<HTMLDivElement>(null);
   const [active, setActive] = useState(false);
+  const [thumb, setThumb] = useState(item.thumbnailPath);
+
+  useEffect(() => {
+    setThumb(item.thumbnailPath);
+  }, [item.thumbnailPath, item.path]);
 
   useEffect(() => {
     const node = slot.current;
@@ -503,13 +810,21 @@ function MediaThumb({ item }: { item: MediaItem }) {
     return () => observer.disconnect();
   }, []);
 
-  const src = active ? previewUrl(item.path) : "";
+  useEffect(() => {
+    if (!active || thumb) return;
+    let cancelled = false;
+    void ensureThumbnail(item.storageId, item.id).then((path) => {
+      if (!cancelled && path) setThumb(path);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [active, thumb, item.storageId, item.id]);
+
+  const src = active && thumb ? previewUrl(thumb) : "";
   return (
-    <div ref={slot} className="thumb-slot">
-      {active && src && item.kind === "video" ? (
-        <video src={src} muted playsInline preload="metadata" />
-      ) : null}
-      {active && src && item.kind !== "video" ? <img src={src} alt="" loading="lazy" /> : null}
+    <div ref={slot} className={src ? "thumb-slot" : "thumb-slot missing"}>
+      {src ? <img src={src} alt="" loading="lazy" /> : null}
     </div>
   );
 }
@@ -519,6 +834,7 @@ function OrganizeView({
   ops,
   selectedOps,
   busy,
+  progress,
   onPreview,
   onToggle,
   onExecute,
@@ -527,6 +843,7 @@ function OrganizeView({
   ops: TransferOp[];
   selectedOps: Set<string>;
   busy: boolean;
+  progress: JobProgress | null;
   onPreview: (storageId?: string) => void;
   onToggle: (source: string) => void;
   onExecute: (storageId: string) => void;
@@ -564,6 +881,7 @@ function OrganizeView({
             Move selected
           </button>
         </div>
+        {busy && progress ? <ProgressMeter progress={progress} /> : null}
       </div>
       <div className="panel-scroll">
         <OpTable ops={ops} selectedOps={selectedOps} onToggle={onToggle} />
@@ -579,6 +897,7 @@ function SyncView({
   ops,
   selectedOps,
   busy,
+  progress,
   onSource,
   onStorage,
   onPick,
@@ -592,6 +911,7 @@ function SyncView({
   ops: TransferOp[];
   selectedOps: Set<string>;
   busy: boolean;
+  progress: JobProgress | null;
   onSource: (value: string) => void;
   onStorage: (value: string) => void;
   onPick: () => void;
@@ -632,6 +952,7 @@ function SyncView({
             Copy selected
           </button>
         </div>
+        {busy && progress ? <ProgressMeter progress={progress} /> : null}
       </div>
       <div className="panel-scroll">
         <OpTable ops={ops} selectedOps={selectedOps} onToggle={onToggle} />
@@ -721,8 +1042,8 @@ function SettingsView({
       <div className="panel-head">
         <h2 className="section-title">VAULT</h2>
         <p className="lede">
-          One library disk, or several — local, mounted network, or a plugged-in drive. Paths are saved
-          in the app config file.
+          One library disk, or several — local, mounted network, or a plugged-in drive. Each storage
+          keeps its own CamOrg folder for the catalog and thumbnails.
         </p>
         <div className="toolbar">
           <select
@@ -787,14 +1108,272 @@ function SettingsView({
   );
 }
 
+function TagsView({
+  tags,
+  categories,
+  onReload,
+  onError,
+}: {
+  tags: GlobalTag[];
+  categories: TagCategory[];
+  onReload: () => Promise<void>;
+  onError: (message: string | null) => void;
+}) {
+  const [categoryName, setCategoryName] = useState("");
+  const [categoryColor, setCategoryColor] = useState(CLASS_COLORS[0]);
+  const [tagName, setTagName] = useState("");
+  const [tagCategoryId, setTagCategoryId] = useState(categories[0]?.id ?? "");
+
+  useEffect(() => {
+    if (tagCategoryId && categories.some((category) => category.id === tagCategoryId)) return;
+    if (categories[0]) setTagCategoryId(categories[0].id);
+  }, [categories, tagCategoryId]);
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <h2 className="section-title">TAGS</h2>
+        <p className="lede">
+          Categories hold a color. Tags belong to a category and inherit that color. Storages only
+          remember which tag names are applied to a file.
+        </p>
+        <h3 className="subsection">Categories</h3>
+        <div className="toolbar">
+          <input
+            type="text"
+            placeholder="Category name"
+            value={categoryName}
+            onChange={(e) => setCategoryName(e.target.value)}
+          />
+          <input
+            type="color"
+            value={categoryColor}
+            onChange={(e) => setCategoryColor(e.target.value)}
+          />
+          <button
+            className="primary"
+            onClick={async () => {
+              const trimmed = categoryName.trim();
+              if (!trimmed) return;
+              try {
+                await saveTagCategory({ name: trimmed, color: categoryColor });
+                setCategoryName("");
+                setCategoryColor(CLASS_COLORS[categories.length % CLASS_COLORS.length]);
+                await onReload();
+                onError(null);
+              } catch (err) {
+                onError(err instanceof Error ? err.message : String(err));
+              }
+            }}
+          >
+            Add category
+          </button>
+        </div>
+        <h3 className="subsection">Tags</h3>
+        <div className="toolbar">
+          <input
+            type="text"
+            placeholder="Tag name"
+            value={tagName}
+            onChange={(e) => setTagName(e.target.value)}
+          />
+          <select
+            value={tagCategoryId}
+            onChange={(e) => setTagCategoryId(e.target.value)}
+            disabled={categories.length === 0}
+          >
+            {categories.length === 0 ? <option value="">No categories</option> : null}
+            {categories.map((category) => (
+              <option key={category.id} value={category.id}>
+                {category.name}
+              </option>
+            ))}
+          </select>
+          <button
+            className="primary"
+            disabled={!tagCategoryId}
+            onClick={async () => {
+              const trimmed = tagName.trim();
+              if (!trimmed || !tagCategoryId) return;
+              try {
+                await saveGlobalTag({ name: trimmed, categoryId: tagCategoryId });
+                setTagName("");
+                await onReload();
+                onError(null);
+              } catch (err) {
+                onError(err instanceof Error ? err.message : String(err));
+              }
+            }}
+          >
+            Add tag
+          </button>
+        </div>
+      </div>
+      <div className="panel-scroll">
+        {categories.map((category) => {
+          const inCategory = tags.filter((tag) => tag.categoryId === category.id);
+          return (
+            <div className="storage-card" key={category.id}>
+              <div className="toolbar class-row">
+                <span className="class-swatch" style={{ background: category.color }} />
+                <input
+                  key={`${category.id}:${category.name}`}
+                  type="text"
+                  defaultValue={category.name}
+                  onBlur={async (e) => {
+                    const next = e.target.value.trim();
+                    if (!next || next === category.name) return;
+                    try {
+                      await saveTagCategory({
+                        id: category.id,
+                        name: next,
+                        color: category.color,
+                      });
+                      await onReload();
+                    } catch (err) {
+                      onError(err instanceof Error ? err.message : String(err));
+                    }
+                  }}
+                />
+                <input
+                  type="color"
+                  value={category.color}
+                  onChange={async (e) => {
+                    try {
+                      await saveTagCategory({
+                        id: category.id,
+                        name: category.name,
+                        color: e.target.value,
+                      });
+                      await onReload();
+                    } catch (err) {
+                      onError(err instanceof Error ? err.message : String(err));
+                    }
+                  }}
+                />
+                <button
+                  className="danger"
+                  disabled={categories.length <= 1}
+                  onClick={async () => {
+                    try {
+                      await deleteTagCategory(category.id);
+                      await onReload();
+                    } catch (err) {
+                      onError(err instanceof Error ? err.message : String(err));
+                    }
+                  }}
+                >
+                  Delete category
+                </button>
+              </div>
+              {inCategory.length === 0 ? (
+                <div className="status">No tags in this category.</div>
+              ) : (
+                inCategory.map((tag) => (
+                  <div className="toolbar class-row" key={tag.id}>
+                    <input
+                      key={`${tag.id}:${tag.name}`}
+                      type="text"
+                      defaultValue={tag.name}
+                      onBlur={async (e) => {
+                        const next = e.target.value.trim();
+                        if (!next || next === tag.name) return;
+                        try {
+                          await saveGlobalTag({
+                            id: tag.id,
+                            name: next,
+                            categoryId: tag.categoryId,
+                          });
+                          await onReload();
+                        } catch (err) {
+                          onError(err instanceof Error ? err.message : String(err));
+                        }
+                      }}
+                    />
+                    <select
+                      value={tag.categoryId}
+                      onChange={async (e) => {
+                        try {
+                          await saveGlobalTag({
+                            id: tag.id,
+                            name: tag.name,
+                            categoryId: e.target.value,
+                          });
+                          await onReload();
+                        } catch (err) {
+                          onError(err instanceof Error ? err.message : String(err));
+                        }
+                      }}
+                    >
+                      {categories.map((option) => (
+                        <option key={option.id} value={option.id}>
+                          {option.name}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      className="danger"
+                      onClick={async () => {
+                        try {
+                          await deleteGlobalTag(tag.id);
+                          await onReload();
+                        } catch (err) {
+                          onError(err instanceof Error ? err.message : String(err));
+                        }
+                      }}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function asMediaTag(tag: Pick<GlobalTag, "name" | "color" | "categoryId" | "categoryName">): MediaTag {
+  return {
+    name: tag.name,
+    color: tag.color,
+    categoryId: tag.categoryId,
+    categoryName: tag.categoryName,
+  };
+}
+
 function PreviewPane({
   item,
+  globalTags,
+  categories,
+  marked,
+  onMarkedChange,
+  onDeleteCurrent,
   onTags,
+  onCreateTag,
 }: {
   item: MediaItem | null;
-  onTags: (tags: string[]) => void;
+  globalTags: GlobalTag[];
+  categories: TagCategory[];
+  marked: boolean;
+  onMarkedChange: (checked: boolean) => void;
+  onDeleteCurrent: () => void;
+  onTags: (tags: MediaTag[]) => void;
+  onCreateTag: (name: string, categoryId: string) => Promise<GlobalTag>;
 }) {
   const [draft, setDraft] = useState("");
+  const [draftCategoryId, setDraftCategoryId] = useState(categories[0]?.id ?? "");
+  const unused = globalTags.filter(
+    (tag) => !item?.tags.some((assigned) => assigned.name.toLowerCase() === tag.name.toLowerCase()),
+  );
+
+  useEffect(() => {
+    if (draftCategoryId && categories.some((category) => category.id === draftCategoryId)) return;
+    if (categories[0]) setDraftCategoryId(categories[0].id);
+  }, [categories, draftCategoryId]);
+
   if (!item) {
     return (
       <aside className="preview-pane">
@@ -827,34 +1406,158 @@ function PreviewPane({
       <div className="tag-row">
         {item.tags.map((tag) => (
           <button
-            key={tag}
+            key={tag.name}
             className="tag"
-            onClick={() => onTags(item.tags.filter((t) => t !== tag))}
+            style={{ borderColor: tag.color, color: tag.color }}
+            onClick={() => onTags(item.tags.filter((t) => t.name !== tag.name))}
           >
-            {tag} ×
+            {tag.name} ×
           </button>
         ))}
       </div>
       <form
         className="toolbar"
-        onSubmit={(event) => {
+        onSubmit={async (event) => {
           event.preventDefault();
-          const tag = draft.trim();
-          if (!tag) return;
-          onTags([...item.tags, tag]);
+          const typed = draft.trim();
+          const picked = unused.find((tag) => tag.name === typed) ?? (typed ? undefined : unused[0]);
+          if (picked) {
+            if (item.tags.some((t) => t.name.toLowerCase() === picked.name.toLowerCase())) {
+              setDraft("");
+              return;
+            }
+            onTags([...item.tags, asMediaTag(picked)]);
+            setDraft("");
+            return;
+          }
+          if (!typed || !draftCategoryId) return;
+          if (item.tags.some((t) => t.name.toLowerCase() === typed.toLowerCase())) {
+            setDraft("");
+            return;
+          }
+          const known = globalTags.find((tag) => tag.name.toLowerCase() === typed.toLowerCase());
+          const created = known ?? (await onCreateTag(typed, draftCategoryId));
+          onTags([...item.tags, asMediaTag(created)]);
           setDraft("");
         }}
       >
+        <select
+          value={unused.some((tag) => tag.name === draft) ? draft : ""}
+          onChange={(e) => setDraft(e.target.value)}
+        >
+          <option value="">Tag</option>
+          {unused.map((tag) => (
+            <option key={tag.id} value={tag.name}>
+              {tag.name}
+            </option>
+          ))}
+        </select>
         <input
           type="text"
-          placeholder="Add tag"
+          placeholder="Or new tag"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
         />
+        <select
+          value={draftCategoryId}
+          onChange={(e) => setDraftCategoryId(e.target.value)}
+          title="Category for new tags"
+          disabled={categories.length === 0}
+        >
+          {categories.map((category) => (
+            <option key={category.id} value={category.id}>
+              {category.name}
+            </option>
+          ))}
+        </select>
         <button className="ghost" type="submit">
-          Tag
+          Add
         </button>
       </form>
+      <div className="delete-actions">
+        <label className="tick delete-tick">
+          <input
+            type="checkbox"
+            checked={marked}
+            onChange={(e) => onMarkedChange(e.target.checked)}
+          />
+          To be deleted
+        </label>
+        <button className="danger" onClick={() => void onDeleteCurrent()}>
+          Delete file
+        </button>
+      </div>
     </aside>
   );
+}
+
+function SidebarIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.7"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="nav-icon"
+      aria-hidden
+    >
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <path d="M9 3v18" />
+    </svg>
+  );
+}
+
+function NavIcon({ id }: { id: NavIconId }) {
+  const common = {
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.7,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+    className: "nav-icon",
+    "aria-hidden": true,
+  };
+  switch (id) {
+    case "library":
+      return (
+        <svg {...common}>
+          <rect x="3" y="4" width="7" height="7" />
+          <rect x="14" y="4" width="7" height="7" />
+          <rect x="3" y="13" width="7" height="7" />
+          <rect x="14" y="13" width="7" height="7" />
+        </svg>
+      );
+    case "organize":
+      return (
+        <svg {...common}>
+          <path d="M4 6h16M4 12h10M4 18h13" />
+          <path d="M16 10l4 2-4 2" />
+        </svg>
+      );
+    case "import":
+      return (
+        <svg {...common}>
+          <path d="M12 3v12" />
+          <path d="M8 11l4 4 4-4" />
+          <path d="M5 21h14" />
+        </svg>
+      );
+    case "tags":
+      return (
+        <svg {...common}>
+          <path d="M3 12l9-9h7v7l-9 9z" />
+          <circle cx="16" cy="8" r="1.2" fill="currentColor" />
+        </svg>
+      );
+    case "settings":
+      return (
+        <svg {...common}>
+          <circle cx="12" cy="12" r="3" />
+          <path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1" />
+        </svg>
+      );
+  }
 }
