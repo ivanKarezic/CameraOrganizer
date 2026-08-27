@@ -7,21 +7,30 @@ use crate::paths::is_organized_path;
 use crate::progress;
 use crate::scan::{hash_file, walk_storage, walk_storage_with_progress};
 use crate::sync::{self, ExternalFile, LibraryIndex};
+use crate::locations::{self, SavedLocation};
 use crate::tags::{self, GlobalTag, TagCategory, TagStore};
 use crate::thumbnails;
 use crate::transfer;
 use chrono::NaiveDate;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 use tauri::{AppHandle, State};
+
+const PRELOAD_YIELD: Duration = Duration::from_millis(30);
 
 pub struct AppState {
     pub config: Mutex<AppConfig>,
     pub config_path: PathBuf,
     pub tags_path: PathBuf,
+    pub locations_path: PathBuf,
+    pub preload_epoch: Arc<AtomicU64>,
+    pub app_started: Arc<AtomicBool>,
 }
 
 fn parse_date(captured_at: &str) -> NaiveDate {
@@ -59,8 +68,11 @@ fn open_storage_db(storage: &Storage) -> Result<Connection, String> {
             storage.name, storage.path
         ));
     }
-    camorg::ensure_layout(root).map_err(String::from)?;
-    catalog::open(&camorg::catalog_path(root)).map_err(String::from)
+    let catalog = camorg::catalog_path(root);
+    if !catalog.exists() {
+        camorg::ensure_layout(root).map_err(String::from)?;
+    }
+    catalog::open(&catalog).map_err(String::from)
 }
 
 fn storage_by_id<'a>(config: &'a AppConfig, storage_id: &str) -> Result<&'a Storage, String> {
@@ -111,6 +123,14 @@ fn save_globals(state: &AppState, store: &TagStore) -> Result<(), String> {
     tags::save(&state.tags_path, store).map_err(String::from)
 }
 
+fn load_locations(state: &AppState) -> Result<locations::LocationStore, String> {
+    locations::load(&state.locations_path).map_err(String::from)
+}
+
+fn save_locations(state: &AppState, store: &locations::LocationStore) -> Result<(), String> {
+    locations::save(&state.locations_path, store).map_err(String::from)
+}
+
 fn for_each_online_db(config: &AppConfig, mut visit: impl FnMut(&Storage, &Connection) -> Result<(), String>) -> Result<(), String> {
     for storage in &config.storages {
         if !Path::new(&storage.path).exists() {
@@ -159,7 +179,6 @@ fn relative_to<'a>(root: &'a Path, path: &'a str) -> PathBuf {
 #[tauri::command]
 pub fn get_config(state: State<AppState>) -> Result<AppConfig, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?.clone();
-    ensure_online_camorg(&config);
     Ok(config)
 }
 
@@ -175,6 +194,7 @@ pub fn save_config(state: State<AppState>, config: AppConfig) -> Result<AppConfi
 
 #[tauri::command]
 pub async fn scan_library(app: AppHandle, state: State<'_, AppState>) -> Result<Vec<MediaItem>, String> {
+    state.preload_epoch.fetch_add(1, Ordering::SeqCst);
     let config = state.config.lock().map_err(|e| e.to_string())?.clone();
     let tags_path = state.tags_path.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -227,29 +247,6 @@ fn run_scan(app: AppHandle, config: AppConfig) -> Result<Vec<MediaItem>, String>
             );
             catalog::upsert_media(&db, item).map_err(String::from)?;
         }
-        let thumbable: Vec<&MediaItem> = walked
-            .iter()
-            .filter(|item| !matches!(item.kind, crate::media::MediaKind::Sidecar))
-            .collect();
-        let thumb_total = thumbable.len() as u64;
-        for (index, item) in thumbable.iter().enumerate() {
-            progress::emit(
-                &app,
-                "thumbnails",
-                index as u64 + 1,
-                thumb_total,
-                &item.filename,
-                "Generating thumbnails",
-            );
-            let rel = relative_to(&root, &item.path);
-            if let Some(thumb_rel) =
-                thumbnails::ensure_thumbnail(&root, Path::new(&item.path), &rel, item.kind)
-                    .map_err(String::from)?
-            {
-                catalog::set_thumbnail_rel(&db, &item.path, &thumb_rel.to_string_lossy())
-                    .map_err(String::from)?;
-            }
-        }
         all.extend(catalog::list_all(&db, &root).map_err(String::from)?);
     }
     all.sort_by(|a, b| b.captured_at.cmp(&a.captured_at).then(a.filename.cmp(&b.filename)));
@@ -257,12 +254,20 @@ fn run_scan(app: AppHandle, config: AppConfig) -> Result<Vec<MediaItem>, String>
 }
 
 #[tauri::command]
-pub fn search_media(state: State<AppState>, query: SearchQuery) -> Result<Vec<MediaItem>, String> {
+pub async fn search_media(
+    state: State<'_, AppState>,
+    query: SearchQuery,
+) -> Result<Vec<MediaItem>, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?.clone();
-    let mut items = collect_library(&config, &query)?;
-    let globals = load_globals(&state)?;
-    paint_items(&mut items, &globals);
-    Ok(items)
+    let tags_path = state.tags_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut items = collect_library(&config, &query)?;
+        let globals = tags::load(&tags_path).map_err(String::from)?;
+        paint_items(&mut items, &globals);
+        Ok(items)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -362,6 +367,65 @@ pub fn set_media_tags(
     Ok(assigned)
 }
 
+#[tauri::command]
+pub fn list_locations(state: State<AppState>) -> Result<Vec<SavedLocation>, String> {
+    Ok(load_locations(&state)?.locations)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocationInput {
+    pub id: Option<String>,
+    pub name: String,
+}
+
+#[tauri::command]
+pub fn save_location(state: State<AppState>, location: LocationInput) -> Result<SavedLocation, String> {
+    let mut store = load_locations(&state)?;
+    let previous = location
+        .id
+        .as_ref()
+        .and_then(|id| store.locations.iter().find(|item| &item.id == id).cloned());
+    let saved = locations::upsert(&mut store, location.id.as_deref(), &location.name).map_err(String::from)?;
+    if let Some(prev) = previous {
+        if !prev.name.eq_ignore_ascii_case(&saved.name) {
+            let config = state.config.lock().map_err(|e| e.to_string())?.clone();
+            for_each_online_db(&config, |_, db| {
+                catalog::rename_location_assignments(db, &prev.name, &saved.name).map_err(String::from)
+            })?;
+        }
+    }
+    save_locations(&state, &store)?;
+    Ok(saved)
+}
+
+#[tauri::command]
+pub fn delete_location(state: State<AppState>, location_id: String) -> Result<(), String> {
+    let mut store = load_locations(&state)?;
+    locations::remove(&mut store, &location_id).map_err(String::from)?;
+    save_locations(&state, &store)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_media_location(
+    state: State<AppState>,
+    storage_id: String,
+    media_id: i64,
+    location: Option<String>,
+) -> Result<Option<String>, String> {
+    let config = state.config.lock().map_err(|e| e.to_string())?.clone();
+    let storage = storage_by_id(&config, &storage_id)?;
+    let db = open_storage_db(storage)?;
+    let saved = catalog::set_location(&db, media_id, location.as_deref()).map_err(String::from)?;
+    if let Some(name) = saved.as_deref() {
+        let mut store = load_locations(&state)?;
+        locations::upsert(&mut store, None, name).map_err(String::from)?;
+        save_locations(&state, &store)?;
+    }
+    Ok(saved)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaRef {
@@ -421,6 +485,117 @@ pub fn ensure_thumbnail(
     ))
 }
 
+fn thumb_kind_rank(kind: MediaKind) -> u8 {
+    match kind {
+        MediaKind::Photo => 0,
+        MediaKind::Video => 1,
+        MediaKind::Sidecar => 2,
+    }
+}
+
+#[tauri::command]
+pub async fn preload_thumbnails(app: AppHandle, state: State<'_, AppState>) -> Result<u64, String> {
+    if !state.app_started.load(Ordering::SeqCst) {
+        return Ok(0);
+    }
+    let epoch = state.preload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+    let epoch_flag = Arc::clone(&state.preload_epoch);
+    let config = state.config.lock().map_err(|e| e.to_string())?.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if epoch_flag.load(Ordering::SeqCst) != epoch {
+            return Ok(0);
+        }
+        let mut dbs: HashMap<String, (PathBuf, Connection)> = HashMap::new();
+        let mut missing = Vec::new();
+        let mut had_media = false;
+        for storage in &config.storages {
+            let root = PathBuf::from(&storage.path);
+            if !root.exists() {
+                continue;
+            }
+            let Ok(db) = open_storage_db(storage) else {
+                continue;
+            };
+            if !had_media {
+                had_media = db
+                    .query_row(
+                        "SELECT 1 FROM media WHERE kind != 'sidecar' LIMIT 1",
+                        [],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .is_some();
+            }
+            if let Ok(rows) = catalog::list_missing_thumbnails(&db) {
+                missing.extend(rows);
+            }
+            dbs.insert(storage.id.clone(), (root, db));
+        }
+        missing.sort_by(|a, b| {
+            thumb_kind_rank(a.kind)
+                .cmp(&thumb_kind_rank(b.kind))
+                .then(b.captured_at.cmp(&a.captured_at))
+                .then(a.filename.cmp(&b.filename))
+        });
+        let total = missing.len() as u64;
+        if total == 0 {
+            if had_media {
+                progress::emit(&app, "preload", 0, 0, "", "Thumbnails ready");
+            }
+            return Ok(0);
+        }
+        progress::emit(&app, "preload", 0, total, "", "Preloading thumbnails");
+        let mut done = 0u64;
+        for item in missing {
+            if epoch_flag.load(Ordering::SeqCst) != epoch {
+                return Ok(done);
+            }
+            thread::sleep(PRELOAD_YIELD);
+            if epoch_flag.load(Ordering::SeqCst) != epoch {
+                return Ok(done);
+            }
+            let Some((root, db)) = dbs.get(&item.storage_id) else {
+                continue;
+            };
+            progress::emit(
+                &app,
+                "preload",
+                done + 1,
+                total,
+                &item.filename,
+                "Preloading thumbnails",
+            );
+            let rel = relative_to(root, &item.path);
+            if let Ok(Some(thumb_rel)) =
+                thumbnails::ensure_thumbnail(root, Path::new(&item.path), &rel, item.kind)
+            {
+                let _ = catalog::set_thumbnail_rel(db, &item.path, &thumb_rel.to_string_lossy());
+                let path = camorg::dir(root)
+                    .join(&thumb_rel)
+                    .to_string_lossy()
+                    .into_owned();
+                progress::emit_thumb_ready(
+                    &app,
+                    &progress::ThumbnailReady {
+                        storage_id: item.storage_id.clone(),
+                        media_id: item.id,
+                        path,
+                    },
+                );
+            }
+            done += 1;
+        }
+        if epoch_flag.load(Ordering::SeqCst) == epoch {
+            progress::emit(&app, "preload", total, total, "", "Thumbnails ready");
+        }
+        Ok(done)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub fn preview_organize(
     state: State<AppState>,
@@ -463,6 +638,7 @@ pub async fn execute_organize(
     storage_id: String,
     operations: Vec<TransferOp>,
 ) -> Result<Vec<String>, String> {
+    state.preload_epoch.fetch_add(1, Ordering::SeqCst);
     let config = state.config.lock().map_err(|e| e.to_string())?.clone();
     tauri::async_runtime::spawn_blocking(move || run_organize(app, config, storage_id, operations))
         .await
@@ -563,6 +739,7 @@ pub async fn execute_sync(
     storage_id: String,
     operations: Vec<TransferOp>,
 ) -> Result<Vec<String>, String> {
+    state.preload_epoch.fetch_add(1, Ordering::SeqCst);
     let config = state.config.lock().map_err(|e| e.to_string())?.clone();
     tauri::async_runtime::spawn_blocking(move || run_sync(app, config, storage_id, operations))
         .await
@@ -593,6 +770,7 @@ fn run_sync(
 }
 
 #[tauri::command]
-pub fn app_ready(_app: AppHandle) -> Result<bool, String> {
+pub fn app_ready(state: State<AppState>) -> Result<bool, String> {
+    state.app_started.store(true, Ordering::SeqCst);
     Ok(true)
 }

@@ -7,6 +7,7 @@ import type {
   MediaItem,
   MediaRef,
   MediaTag,
+  SavedLocation,
   SearchQuery,
   TagCategory,
   TransferOp,
@@ -68,6 +69,33 @@ export async function setMediaTags(
   return invoke("set_media_tags", { storageId, mediaId, tags });
 }
 
+export async function listLocations(): Promise<SavedLocation[]> {
+  return invoke("list_locations");
+}
+
+export async function saveLocation(location: {
+  id?: string | null;
+  name: string;
+}): Promise<SavedLocation> {
+  return invoke("save_location", { location });
+}
+
+export async function deleteLocation(locationId: string): Promise<void> {
+  return invoke("delete_location", { locationId });
+}
+
+export async function setMediaLocation(
+  storageId: string,
+  mediaId: number,
+  location: string | null,
+): Promise<string | null> {
+  return invoke("set_media_location", { storageId, mediaId, location });
+}
+
+export async function appReady(): Promise<boolean> {
+  return invoke("app_ready");
+}
+
 export async function deleteMedia(storageId: string, mediaId: number): Promise<void> {
   return invoke("delete_media", { storageId, mediaId });
 }
@@ -81,6 +109,10 @@ export async function ensureThumbnail(
   mediaId: number,
 ): Promise<string | null> {
   return invoke("ensure_thumbnail", { storageId, mediaId });
+}
+
+export async function preloadThumbnails(): Promise<number> {
+  return invoke("preload_thumbnails");
 }
 
 export async function previewOrganize(storageId?: string): Promise<TransferOp[]> {

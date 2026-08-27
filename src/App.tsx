@@ -2,7 +2,9 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  appReady,
   deleteGlobalTag,
+  deleteLocation,
   deleteMedia,
   deleteMediaBatch,
   deleteTagCategory,
@@ -10,17 +12,21 @@ import {
   executeOrganize,
   executeSync,
   getConfig,
+  listLocations,
   listTagCategories,
   listTags,
   pickDirectory,
+  preloadThumbnails,
   previewOrganize,
   previewSync,
   previewUrl,
   saveConfig,
   saveGlobalTag,
+  saveLocation,
   saveTagCategory,
   scanLibrary,
   searchMedia,
+  setMediaLocation,
   setMediaTags,
 } from "./api";
 import { DateRangePicker } from "./DateRangePicker";
@@ -33,10 +39,12 @@ import type {
   JobProgress,
   MediaItem,
   MediaTag,
+  SavedLocation,
   SearchQuery,
   Storage,
   StorageKind,
   TagCategory,
+  ThumbnailReady,
   TransferOp,
   ViewId,
 } from "./types";
@@ -76,11 +84,16 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState<JobProgress | null>(null);
+  const [preload, setPreload] = useState<JobProgress | null>(null);
   const [unorganizedOnly, setUnorganizedOnly] = useState(false);
   const [kinds, setKinds] = useState<KindVisibility>({ photo: true, video: true });
   const [search, setSearch] = useState<SearchQuery>({});
   const [tags, setTags] = useState<GlobalTag[]>([]);
   const [categories, setCategories] = useState<TagCategory[]>([]);
+  const [locations, setLocations] = useState<SavedLocation[]>([]);
+  const [uiReady, setUiReady] = useState(false);
+  const [catalogLoaded, setCatalogLoaded] = useState(false);
+  const [expandedPreview, setExpandedPreview] = useState(false);
   const [markedForDelete, setMarkedForDelete] = useState<Set<string>>(new Set());
   const [navCollapsed, setNavCollapsed] = useState(false);
   const [ops, setOps] = useState<TransferOp[]>([]);
@@ -90,8 +103,13 @@ export default function App() {
 
   useEffect(() => {
     const webview = getCurrentWebviewWindow();
-    let unlisten: (() => void) | undefined;
+    const unlisten: Array<() => void> = [];
     const onProgress = (payload: JobProgress) => {
+      if (payload.job === "preload") {
+        setPreload(payload);
+        return;
+      }
+      setPreload(null);
       setProgress(payload);
       const count =
         payload.total > 0
@@ -103,21 +121,28 @@ export default function App() {
         payload.filename ? `${payload.message}${count} — ${payload.filename}` : `${payload.message}${count}`,
       );
     };
-    void webview
-      .listen<JobProgress>("job-progress", (event) => onProgress(event.payload))
-      .then((fn) => {
-        unlisten = fn;
-      })
-      .catch(() => {
-        void listen<JobProgress>("job-progress", (event) => onProgress(event.payload)).then((fn) => {
-          unlisten = fn;
-        });
-      });
-    return () => unlisten?.();
+    const onThumb = (payload: ThumbnailReady) => {
+      setItems((current) =>
+        current.map((item) =>
+          item.storageId === payload.storageId && item.id === payload.mediaId
+            ? { ...item, thumbnailPath: payload.path }
+            : item,
+        ),
+      );
+    };
+    const bind = async (
+      listenFn: typeof webview.listen,
+    ) => {
+      unlisten.push(await listenFn<JobProgress>("job-progress", (event) => onProgress(event.payload)));
+      unlisten.push(await listenFn<ThumbnailReady>("thumbnail-ready", (event) => onThumb(event.payload)));
+    };
+    void bind(webview.listen.bind(webview)).catch(() => {
+      void bind(listen);
+    });
+    return () => unlisten.forEach((fn) => fn());
   }, []);
 
   async function loadCatalog() {
-    setBusy(true);
     setError(null);
     try {
       const cfg = await getConfig();
@@ -127,9 +152,17 @@ export default function App() {
         setStatus("Add a media storage in Settings.");
         return;
       }
-      const found = await searchMedia({});
+      setStatus("Loading catalog…");
+      const [found, nextTags, nextCategories, nextLocations] = await Promise.all([
+        searchMedia({}),
+        listTags(),
+        listTagCategories(),
+        listLocations(),
+      ]);
       setItems(found);
-      await reloadTagStore();
+      setTags(nextTags);
+      setCategories(nextCategories);
+      setLocations(nextLocations);
       setStatus(
         found.length
           ? `${found.length} files in catalog.`
@@ -141,8 +174,7 @@ export default function App() {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setBusy(false);
-      setProgress(null);
+      setCatalogLoaded(true);
     }
   }
 
@@ -177,15 +209,55 @@ export default function App() {
   }
 
   async function reloadTagStore() {
-    const [nextTags, nextCategories] = await Promise.all([listTags(), listTagCategories()]);
+    const [nextTags, nextCategories, nextLocations] = await Promise.all([
+      listTags(),
+      listTagCategories(),
+      listLocations(),
+    ]);
     setTags(nextTags);
     setCategories(nextCategories);
+    setLocations(nextLocations);
   }
 
   useEffect(() => {
     void loadCatalog();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!catalogLoaded || uiReady || busy || scanning) return;
+    let cancelled = false;
+    const markReady = () => {
+      void (async () => {
+        try {
+          await appReady();
+        } catch {
+          // Web preview without Tauri still marks the UI ready.
+        }
+        if (!cancelled) setUiReady(true);
+      })();
+    };
+    let timer = window.setTimeout(markReady, 4000);
+    const bump = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(markReady, 4000);
+    };
+    window.addEventListener("pointerdown", bump, { passive: true });
+    window.addEventListener("keydown", bump);
+    window.addEventListener("wheel", bump, { passive: true });
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      window.removeEventListener("pointerdown", bump);
+      window.removeEventListener("keydown", bump);
+      window.removeEventListener("wheel", bump);
+    };
+  }, [catalogLoaded, busy, scanning, uiReady]);
+
+  useEffect(() => {
+    if (!uiReady || busy || scanning) return;
+    void preloadThumbnails();
+  }, [uiReady, busy, scanning]);
 
   const visible = useMemo(
     () => items.filter((item) => matchesLibraryFilters(item, search, unorganizedOnly, kinds)),
@@ -214,7 +286,16 @@ export default function App() {
   }, [captureDays, search.dateFrom, search.dateTo]);
 
   useEffect(() => {
+    if (!selected) setExpandedPreview(false);
+  }, [selected]);
+
+  useEffect(() => {
     function onKey(event: KeyboardEvent) {
+      if (event.key === "Escape" && expandedPreview) {
+        event.preventDefault();
+        setExpandedPreview(false);
+        return;
+      }
       const target = event.target as HTMLElement | null;
       const tag = target?.tagName;
       if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || tag === "VIDEO") return;
@@ -224,7 +305,7 @@ export default function App() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selected, ordered]);
+  }, [selected, ordered, expandedPreview]);
 
   function stepPreview(delta: number) {
     if (ordered.length === 0) return;
@@ -275,6 +356,7 @@ export default function App() {
         </div>
         {navCollapsed ? null : <p className={error ? "status error" : "status"}>{error ?? status}</p>}
         {navCollapsed ? null : <ProgressMeter progress={progress} />}
+        <PreloadStatus progress={preload} collapsed={navCollapsed} />
       </nav>
       <main className="stage">
         {view === "library" && (
@@ -285,10 +367,11 @@ export default function App() {
             kinds={kinds}
             search={search}
             captureDays={captureDays}
+            locations={locations}
             tags={tags}
             categories={categories}
             matchCount={visible.length}
-            busy={busy}
+            busy={busy || !catalogLoaded}
             scanning={scanning}
             progress={progress}
             onToggleUnorganized={() => setUnorganizedOnly((v) => !v)}
@@ -424,6 +507,7 @@ export default function App() {
           <TagsView
             tags={tags}
             categories={categories}
+            locations={locations}
             onReload={reloadTagStore}
             onError={setError}
           />
@@ -515,7 +599,66 @@ export default function App() {
           await reloadTagStore();
           return created;
         }}
+        locations={locations}
+        onLocation={async (label) => {
+          if (!selected) return;
+          const saved = await setMediaLocation(selected.storageId, selected.id, label);
+          setSelected({ ...selected, locationLabel: saved });
+          setItems((current) =>
+            current.map((item) =>
+              item.id === selected.id && item.storageId === selected.storageId
+                ? { ...item, locationLabel: saved }
+                : item,
+            ),
+          );
+          setLocations(await listLocations());
+        }}
+        onExpand={() => setExpandedPreview(true)}
       />
+      {expandedPreview && selected ? (
+        <MediaLightbox
+          item={selected}
+          index={ordered.findIndex((item) => mediaKey(item) === mediaKey(selected))}
+          total={ordered.length}
+          onPrev={() => stepPreview(-1)}
+          onNext={() => stepPreview(1)}
+          onClose={() => setExpandedPreview(false)}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function PreloadStatus({
+  progress,
+  collapsed,
+}: {
+  progress: JobProgress | null;
+  collapsed: boolean;
+}) {
+  if (!progress) return null;
+  const total = progress.total;
+  const current = progress.current;
+  const done = total === 0 || (total > 0 && current >= total);
+  const pct = total > 0 ? Math.min(100, (current / total) * 100) : done ? 100 : 0;
+  const label = done
+    ? "Thumbnails ready"
+    : total > 0
+      ? `Preloading ${current} / ${total}`
+      : "Preloading thumbnails";
+  return (
+    <div
+      className={collapsed ? "nav-preload collapsed" : "nav-preload"}
+      role="status"
+      title={label}
+    >
+      {collapsed ? null : <div className="preload-label">{label}</div>}
+      <div className="progress-track">
+        <div
+          className={total > 0 || done ? "progress-fill" : "progress-fill indeterminate"}
+          style={total > 0 || done ? { width: `${pct}%` } : undefined}
+        />
+      </div>
     </div>
   );
 }
@@ -556,6 +699,7 @@ function LibraryView({
   kinds,
   search,
   captureDays,
+  locations,
   tags,
   categories,
   matchCount,
@@ -578,6 +722,7 @@ function LibraryView({
   kinds: KindVisibility;
   search: SearchQuery;
   captureDays: string[];
+  locations: SavedLocation[];
   tags: GlobalTag[];
   categories: TagCategory[];
   matchCount: number;
@@ -672,9 +817,15 @@ function LibraryView({
         <input
           type="text"
           placeholder="Location"
+          list="library-locations"
           value={search.location ?? ""}
-          onChange={(e) => onSearchChange({ ...search, location: e.target.value })}
+          onChange={(e) => onSearchChange({ ...search, location: e.target.value || null })}
         />
+        <datalist id="library-locations">
+          {locations.map((location) => (
+            <option key={location.id} value={location.name} />
+          ))}
+        </datalist>
         <DateRangePicker
           days={captureDays}
           dateFrom={search.dateFrom}
@@ -833,11 +984,15 @@ function LibraryView({
 
 function MediaThumb({ item }: { item: MediaItem }) {
   const slot = useRef<HTMLDivElement>(null);
+  const tried = useRef(false);
   const [active, setActive] = useState(false);
   const [thumb, setThumb] = useState(item.thumbnailPath);
+  const [broken, setBroken] = useState(false);
 
   useEffect(() => {
     setThumb(item.thumbnailPath);
+    setBroken(false);
+    tried.current = false;
   }, [item.thumbnailPath, item.path]);
 
   useEffect(() => {
@@ -857,20 +1012,34 @@ function MediaThumb({ item }: { item: MediaItem }) {
   }, []);
 
   useEffect(() => {
-    if (!active || thumb) return;
+    if (!active || (thumb && !broken) || tried.current) return;
+    tried.current = true;
     let cancelled = false;
     void ensureThumbnail(item.storageId, item.id).then((path) => {
-      if (!cancelled && path) setThumb(path);
+      if (cancelled) return;
+      if (path) {
+        setBroken(false);
+        setThumb(path);
+      } else {
+        setThumb(null);
+      }
     });
     return () => {
       cancelled = true;
     };
-  }, [active, thumb, item.storageId, item.id]);
+  }, [active, thumb, broken, item.storageId, item.id]);
 
-  const src = active && thumb ? previewUrl(thumb) : "";
+  const src = active && thumb && !broken ? previewUrl(thumb) : "";
   return (
     <div ref={slot} className={src ? "thumb-slot" : "thumb-slot missing"}>
-      {src ? <img src={src} alt="" loading="lazy" /> : null}
+      {src ? (
+        <img
+          src={src}
+          alt=""
+          loading="lazy"
+          onError={() => setBroken(true)}
+        />
+      ) : null}
     </div>
   );
 }
@@ -1157,11 +1326,13 @@ function SettingsView({
 function TagsView({
   tags,
   categories,
+  locations,
   onReload,
   onError,
 }: {
   tags: GlobalTag[];
   categories: TagCategory[];
+  locations: SavedLocation[];
   onReload: () => Promise<void>;
   onError: (message: string | null) => void;
 }) {
@@ -1169,6 +1340,7 @@ function TagsView({
   const [categoryColor, setCategoryColor] = useState(CLASS_COLORS[0]);
   const [tagName, setTagName] = useState("");
   const [tagCategoryId, setTagCategoryId] = useState(categories[0]?.id ?? "");
+  const [locationName, setLocationName] = useState("");
 
   useEffect(() => {
     if (tagCategoryId && categories.some((category) => category.id === tagCategoryId)) return;
@@ -1252,6 +1424,36 @@ function TagsView({
             }}
           >
             Add tag
+          </button>
+        </div>
+        <h3 className="subsection">Locations</h3>
+        <p className="lede">
+          Named places for files that have no GPS. Assign them in the preview, or add them here
+          first.
+        </p>
+        <div className="toolbar">
+          <input
+            type="text"
+            placeholder="Location name"
+            value={locationName}
+            onChange={(e) => setLocationName(e.target.value)}
+          />
+          <button
+            className="primary"
+            onClick={async () => {
+              const trimmed = locationName.trim();
+              if (!trimmed) return;
+              try {
+                await saveLocation({ name: trimmed });
+                setLocationName("");
+                await onReload();
+                onError(null);
+              } catch (err) {
+                onError(err instanceof Error ? err.message : String(err));
+              }
+            }}
+          >
+            Add location
           </button>
         </div>
       </div>
@@ -1376,6 +1578,43 @@ function TagsView({
             </div>
           );
         })}
+        <h3 className="subsection">Saved locations</h3>
+        {locations.length === 0 ? (
+          <div className="empty">No locations yet. Add a name, or type one in the preview.</div>
+        ) : (
+          locations.map((location) => (
+            <div className="toolbar class-row" key={location.id}>
+              <input
+                key={`${location.id}:${location.name}`}
+                type="text"
+                defaultValue={location.name}
+                onBlur={async (e) => {
+                  const next = e.target.value.trim();
+                  if (!next || next === location.name) return;
+                  try {
+                    await saveLocation({ id: location.id, name: next });
+                    await onReload();
+                  } catch (err) {
+                    onError(err instanceof Error ? err.message : String(err));
+                  }
+                }}
+              />
+              <button
+                className="danger"
+                onClick={async () => {
+                  try {
+                    await deleteLocation(location.id);
+                    await onReload();
+                  } catch (err) {
+                    onError(err instanceof Error ? err.message : String(err));
+                  }
+                }}
+              >
+                Delete
+              </button>
+            </div>
+          ))
+        )}
       </div>
     </section>
   );
@@ -1398,11 +1637,14 @@ function PreviewPane({
   onNext,
   globalTags,
   categories,
+  locations,
   marked,
   onMarkedChange,
   onDeleteCurrent,
   onTags,
   onCreateTag,
+  onLocation,
+  onExpand,
 }: {
   item: MediaItem | null;
   index: number;
@@ -1411,17 +1653,25 @@ function PreviewPane({
   onNext: () => void;
   globalTags: GlobalTag[];
   categories: TagCategory[];
+  locations: SavedLocation[];
   marked: boolean;
   onMarkedChange: (checked: boolean) => void;
   onDeleteCurrent: () => void;
   onTags: (tags: MediaTag[]) => void;
   onCreateTag: (name: string, categoryId: string) => Promise<GlobalTag>;
+  onLocation: (label: string | null) => Promise<void>;
+  onExpand: () => void;
 }) {
   const [draft, setDraft] = useState("");
   const [draftCategoryId, setDraftCategoryId] = useState(categories[0]?.id ?? "");
+  const [locationDraft, setLocationDraft] = useState(item?.locationLabel ?? "");
   const unused = globalTags.filter(
     (tag) => !item?.tags.some((assigned) => assigned.name.toLowerCase() === tag.name.toLowerCase()),
   );
+
+  useEffect(() => {
+    setLocationDraft(item?.locationLabel ?? "");
+  }, [item?.id, item?.locationLabel]);
 
   useEffect(() => {
     if (draftCategoryId && categories.some((category) => category.id === draftCategoryId)) return;
@@ -1466,6 +1716,17 @@ function PreviewPane({
             </button>
           </>
         ) : null}
+        {item.kind === "sidecar" ? null : (
+          <button
+            type="button"
+            className="preview-expand"
+            onClick={onExpand}
+            aria-label="Open larger preview"
+            title="Larger preview"
+          >
+            <ExpandIcon />
+          </button>
+        )}
       </div>
       {total > 0 ? (
         <div className="preview-count">
@@ -1478,7 +1739,36 @@ function PreviewPane({
         </div>
         <div>Camera {item.camera}</div>
         <div>Date {formatCaptureDate(item.capturedAt)} ({item.dateSource})</div>
-        <div>Location {item.locationLabel ?? "—"}</div>
+        <form
+          className="location-edit"
+          onSubmit={async (event) => {
+            event.preventDefault();
+            const next = locationDraft.trim();
+            await onLocation(next || null);
+          }}
+        >
+          <label>
+            Location
+            <input
+              type="text"
+              list="preview-locations"
+              placeholder="Add a place if GPS is missing"
+              value={locationDraft}
+              onChange={(e) => setLocationDraft(e.target.value)}
+              onBlur={async () => {
+                const next = locationDraft.trim();
+                const current = item.locationLabel ?? "";
+                if (next === current) return;
+                await onLocation(next || null);
+              }}
+            />
+          </label>
+          <datalist id="preview-locations">
+            {locations.map((location) => (
+              <option key={location.id} value={location.name} />
+            ))}
+          </datalist>
+        </form>
         <div>{formatBytes(item.size)}</div>
         <div>{item.organized ? "Shelved" : "Loose in the vault"}</div>
       </div>
@@ -1567,6 +1857,71 @@ function PreviewPane({
         </button>
       </div>
     </aside>
+  );
+}
+
+function MediaStage({ item }: { item: MediaItem }) {
+  const src = previewUrl(item.path);
+  if (item.kind === "video") return <video src={src} controls />;
+  if (item.kind === "photo") return <img src={src} alt={item.filename} />;
+  return <span className="status">Sidecar — no preview</span>;
+}
+
+function MediaLightbox({
+  item,
+  index,
+  total,
+  onPrev,
+  onNext,
+  onClose,
+}: {
+  item: MediaItem;
+  index: number;
+  total: number;
+  onPrev: () => void;
+  onNext: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Large preview">
+      <div className="lightbox-frame">
+        <MediaStage item={item} />
+        {total > 0 ? (
+          <>
+            <button type="button" className="preview-nav prev" onClick={onPrev} aria-label="Previous file">
+              ‹
+            </button>
+            <button type="button" className="preview-nav next" onClick={onNext} aria-label="Next file">
+              ›
+            </button>
+          </>
+        ) : null}
+        <button type="button" className="lightbox-close" onClick={onClose} aria-label="Close large preview">
+          ×
+        </button>
+        {total > 0 ? (
+          <div className="lightbox-count">
+            {index >= 0 ? index + 1 : 0} / {total}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function ExpandIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M9 3H3v6M15 3h6v6M9 21H3v-6M21 15v6h-6" />
+    </svg>
   );
 }
 

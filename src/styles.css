@@ -566,9 +566,111 @@ select {
   right: 8px;
 }
 
-.preview-nav:hover {
+.preview-expand {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  z-index: 3;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(12, 10, 8, 0.72);
+  color: var(--cream);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(8px);
+}
+
+.preview-expand svg {
+  width: 16px;
+  height: 16px;
+}
+
+.preview-expand:hover {
   color: var(--amber);
   border-color: var(--amber);
+}
+
+.lightbox {
+  position: fixed;
+  inset: 28px;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  background: rgba(10, 8, 6, 0.92);
+  border: 1px solid var(--line);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55);
+}
+
+.lightbox-frame {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+}
+
+.lightbox-frame img,
+.lightbox-frame video {
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+}
+
+.lightbox-close {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 3;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  background: rgba(12, 10, 8, 0.72);
+  color: var(--cream);
+  border: 1px solid var(--line);
+  font-size: 22px;
+  line-height: 1;
+}
+
+.lightbox-close:hover {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+
+.lightbox-count {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.location-edit {
+  margin: 6px 0;
+}
+
+.location-edit label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.location-edit input {
+  text-transform: none;
+  letter-spacing: 0;
 }
 
 .preview-count {
@@ -954,7 +1056,26 @@ input[type="color"] {
 }
 
 .nav > .status {
+  margin-top: 0;
+}
+
+.nav-preload {
   margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.nav-preload.collapsed {
+  align-items: stretch;
+}
+
+.preload-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  word-break: break-word;
 }
 
 .status.error {

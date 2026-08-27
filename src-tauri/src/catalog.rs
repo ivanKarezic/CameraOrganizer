@@ -5,6 +5,7 @@ use crate::media::MediaKind;
 use crate::metadata::DateSource;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,8 +115,22 @@ fn init_schema(conn: &Connection) -> AppResult<()> {
             PRIMARY KEY (media_id, name)
         );
         INSERT OR IGNORE INTO tag_classes (id, name, color) VALUES (1, 'General', '#e59a2a');
+        "#,
+    )?;
+    migrate_legacy_tag_names(conn)?;
+    Ok(())
+}
+
+fn migrate_legacy_tag_names(conn: &Connection) -> AppResult<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version >= 2 {
+        return Ok(());
+    }
+    conn.execute_batch(
+        r#"
         INSERT OR IGNORE INTO media_tag_names (media_id, name)
             SELECT mt.media_id, t.name FROM media_tags mt JOIN tags t ON t.id = mt.tag_id;
+        PRAGMA user_version = 2;
         "#,
     )?;
     Ok(())
@@ -166,8 +181,7 @@ fn date_source_from(label: &str) -> DateSource {
 
 fn abs_thumb(storage_root: &Path, rel: Option<String>) -> Option<String> {
     let rel = rel.filter(|s| !s.is_empty())?;
-    let path = camorg::dir(storage_root).join(rel);
-    path.is_file().then(|| path.to_string_lossy().into_owned())
+    Some(camorg::dir(storage_root).join(rel).to_string_lossy().into_owned())
 }
 
 pub fn upsert_media(conn: &Connection, item: &MediaItem) -> AppResult<i64> {
@@ -188,7 +202,7 @@ pub fn upsert_media(conn: &Connection, item: &MediaItem) -> AppResult<i64> {
             date_source = excluded.date_source,
             latitude = excluded.latitude,
             longitude = excluded.longitude,
-            location_label = excluded.location_label,
+            location_label = COALESCE(media.location_label, excluded.location_label),
             organized = excluded.organized
         "#,
         params![
@@ -368,11 +382,72 @@ pub fn search(conn: &Connection, storage_root: &Path, query: &SearchQuery) -> Ap
 
     let mut items = Vec::new();
     for row in rows {
-        let mut item = row?;
-        item.tags = tags_for(conn, item.id)?;
-        items.push(item);
+        items.push(row?);
+    }
+    attach_tags(conn, &mut items)?;
+    Ok(items)
+}
+
+#[derive(Debug, Clone)]
+pub struct MissingThumb {
+    pub id: i64,
+    pub storage_id: String,
+    pub path: String,
+    pub filename: String,
+    pub kind: MediaKind,
+    pub captured_at: String,
+}
+
+pub fn list_missing_thumbnails(conn: &Connection) -> AppResult<Vec<MissingThumb>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, storage_id, path, filename, kind, captured_at
+        FROM media
+        WHERE IFNULL(thumbnail_rel, '') = '' AND kind != 'sidecar'
+        ORDER BY captured_at DESC, filename ASC
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(MissingThumb {
+            id: row.get(0)?,
+            storage_id: row.get(1)?,
+            path: row.get(2)?,
+            filename: row.get(3)?,
+            kind: kind_from_label(&row.get::<_, String>(4)?),
+            captured_at: row.get(5)?,
+        })
+    })?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row?);
     }
     Ok(items)
+}
+
+fn attach_tags(conn: &Connection, items: &mut [MediaItem]) -> AppResult<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT media_id, name FROM media_tag_names ORDER BY media_id, name",
+    )?;
+    let mut by_id: HashMap<i64, Vec<AssignedTag>> = HashMap::new();
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (media_id, name) = row?;
+        by_id.entry(media_id).or_default().push(AssignedTag {
+            name,
+            color: "#9a8c78".into(),
+            category_id: String::new(),
+            category_name: String::new(),
+        });
+    }
+    for item in items {
+        if let Some(tags) = by_id.remove(&item.id) {
+            item.tags = tags;
+        }
+    }
+    Ok(())
 }
 
 fn tags_for(conn: &Connection, media_id: i64) -> AppResult<Vec<AssignedTag>> {
@@ -430,6 +505,26 @@ pub fn delete_tag_assignments(conn: &Connection, name: &str) -> AppResult<()> {
     conn.execute(
         "DELETE FROM media_tag_names WHERE name = ?1 COLLATE NOCASE",
         params![name],
+    )?;
+    Ok(())
+}
+
+pub fn set_location(conn: &Connection, media_id: i64, location: Option<&str>) -> AppResult<Option<String>> {
+    let value = location
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    conn.execute(
+        "UPDATE media SET location_label = ?1 WHERE id = ?2",
+        params![value, media_id],
+    )?;
+    Ok(value)
+}
+
+pub fn rename_location_assignments(conn: &Connection, from: &str, to: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE media SET location_label = ?1 WHERE location_label = ?2 COLLATE NOCASE",
+        params![to, from],
     )?;
     Ok(())
 }
@@ -503,6 +598,18 @@ mod tests {
     }
 
     #[test]
+    fn lists_rows_without_thumbnails() {
+        let conn = open_memory().unwrap();
+        let item = sample_item();
+        upsert_media(&conn, &item).unwrap();
+        let missing = list_missing_thumbnails(&conn).unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].filename, "DJI_0001.JPG");
+        set_thumbnail_rel(&conn, &item.path, "Thumbnails/x.jpg").unwrap();
+        assert!(list_missing_thumbnails(&conn).unwrap().is_empty());
+    }
+
+    #[test]
     fn search_by_tag_and_unorganized() {
         let conn = open_memory().unwrap();
         let root = tempdir().unwrap();
@@ -537,6 +644,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(unorganized.len(), 1);
+    }
+
+    #[test]
+    fn keeps_existing_location_and_allows_override() {
+        let conn = open_memory().unwrap();
+        let mut item = sample_item();
+        let id = upsert_media(&conn, &item).unwrap();
+        item.location_label = None;
+        upsert_media(&conn, &item).unwrap();
+        let stored = get_by_id(&conn, Path::new("/"), id).unwrap().unwrap();
+        assert_eq!(stored.location_label.as_deref(), Some("47.1, 8.5"));
+        set_location(&conn, id, Some("Alps")).unwrap();
+        let stored = get_by_id(&conn, Path::new("/"), id).unwrap().unwrap();
+        assert_eq!(stored.location_label.as_deref(), Some("Alps"));
     }
 
     #[test]

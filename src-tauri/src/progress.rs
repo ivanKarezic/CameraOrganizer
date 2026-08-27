@@ -54,3 +54,21 @@ pub fn emit(app: &AppHandle, job: &str, current: u64, total: u64, filename: &str
         let _ = app.emit(EVENT, &payload);
     }
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThumbnailReady {
+    pub storage_id: String,
+    pub media_id: i64,
+    pub path: String,
+}
+
+pub const THUMB_READY: &str = "thumbnail-ready";
+
+pub fn emit_thumb_ready(app: &AppHandle, ready: &ThumbnailReady) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.emit(THUMB_READY, ready);
+    } else {
+        let _ = app.emit(THUMB_READY, ready);
+    }
+}

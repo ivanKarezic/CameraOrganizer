@@ -39,6 +39,11 @@ export interface MediaTag {
   categoryName: string;
 }
 
+export interface SavedLocation {
+  id: string;
+  name: string;
+}
+
 export interface MediaItem {
   id: number;
   storageId: string;
@@ -84,6 +89,12 @@ export interface JobProgress {
   total: number;
   filename: string;
   message: string;
+}
+
+export interface ThumbnailReady {
+  storageId: string;
+  mediaId: number;
+  path: string;
 }
 
 export interface MediaRef {
